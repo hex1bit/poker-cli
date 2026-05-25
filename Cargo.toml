@@ -1,0 +1,27 @@
+[package]
+name = "poker"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "poker"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "equity_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
