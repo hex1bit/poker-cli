@@ -4,12 +4,12 @@ use rand::Rng;
 
 use crate::bot::mood::Mood;
 use crate::bot::personality::Personality;
+use crate::bot::skill::SkillLevel;
+use crate::card::{Card, Rank};
 use crate::equity::{mc_equity, preflop_strength};
 use crate::game::action::Action;
 use crate::game::state::{HandState, PlayerStatus, Stage};
-
-/// 蒙特卡洛采样次数。Postflop 决策时使用。
-const MC_ITERS: usize = 600;
+use crate::table::profile::TableRead;
 
 /// 让一个 bot 在当前状态下决定动作（不带 mood，等价于 mood = default）。
 ///
@@ -20,7 +20,14 @@ pub fn decide<R: Rng + ?Sized>(
     persona: Personality,
     rng: &mut R,
 ) -> Action {
-    decide_with_mood(state, seat, persona, &Mood::default(), rng)
+    decide_with_mood_and_skill(
+        state,
+        seat,
+        persona,
+        SkillLevel::DEFAULT,
+        &Mood::default(),
+        rng,
+    )
 }
 
 /// 带情绪的决策：tilt 上升时 effective aggression / vpip / bluff 也提升。
@@ -29,6 +36,51 @@ pub fn decide_with_mood<R: Rng + ?Sized>(
     seat: usize,
     persona: Personality,
     mood: &Mood,
+    rng: &mut R,
+) -> Action {
+    decide_with_mood_and_skill(state, seat, persona, SkillLevel::DEFAULT, mood, rng)
+}
+
+/// 带能力档位的决策，但不读取桌面画像。
+pub fn decide_with_mood_and_skill<R: Rng + ?Sized>(
+    state: &HandState,
+    seat: usize,
+    persona: Personality,
+    skill: SkillLevel,
+    mood: &Mood,
+    rng: &mut R,
+) -> Action {
+    decide_with_mood_profile_skill(state, seat, persona, skill, mood, None, rng)
+}
+
+/// 带桌面画像的决策。画像来自已观察到的对手 VPIP/PFR/aggression，用于轻量调参。
+pub fn decide_with_mood_and_profile<R: Rng + ?Sized>(
+    state: &HandState,
+    seat: usize,
+    persona: Personality,
+    mood: &Mood,
+    table_read: Option<TableRead>,
+    rng: &mut R,
+) -> Action {
+    decide_with_mood_profile_skill(
+        state,
+        seat,
+        persona,
+        SkillLevel::DEFAULT,
+        mood,
+        table_read,
+        rng,
+    )
+}
+
+/// 带桌面画像和能力档位的决策。
+pub fn decide_with_mood_profile_skill<R: Rng + ?Sized>(
+    state: &HandState,
+    seat: usize,
+    persona: Personality,
+    skill: SkillLevel,
+    mood: &Mood,
+    table_read: Option<TableRead>,
     rng: &mut R,
 ) -> Action {
     let hole = state.players[seat]
@@ -47,17 +99,45 @@ pub fn decide_with_mood<R: Rng + ?Sized>(
 
     // mood 注入：tilt 上升 → 更激进、更松、更爱 bluff
     let tilt = mood.tilt;
-    let eff_aggression = (persona.aggression * (1.0 + tilt)).min(6.0);
-    let eff_vpip = (persona.vpip + tilt * 0.10).clamp(0.0, 1.0);
-    let eff_pfr = (persona.pfr + tilt * 0.10).clamp(0.0, 1.0);
-    let eff_bluff = (persona.bluff_freq + tilt * 0.10).clamp(0.0, 1.0);
+    let read = table_read.unwrap_or_default();
+    let profile_weight = skill.profile_weight();
+    let table_loose = if read.samples == 0 {
+        0.0
+    } else {
+        ((read.avg_vpip - 0.30) * profile_weight).clamp(-0.20, 0.30)
+    };
+    let table_aggressive = if read.samples == 0 {
+        0.0
+    } else {
+        (((read.avg_aggression - 1.5) / 4.0) * profile_weight).clamp(-0.20, 0.30)
+    };
+    let table_raises = if read.samples == 0 {
+        0.0
+    } else {
+        ((read.avg_pfr - 0.18) * profile_weight).clamp(-0.15, 0.25)
+    };
+
+    let eff_aggression =
+        (persona.aggression * (1.0 + tilt) * (1.0 - table_aggressive * 0.20)).clamp(0.1, 6.0);
+    let eff_vpip = (persona.vpip + tilt * 0.10 - table_raises * 0.10).clamp(0.0, 1.0);
+    let eff_pfr = (persona.pfr + tilt * 0.10 - table_loose * 0.08).clamp(0.0, 1.0);
+    let eff_bluff = (persona.bluff_freq + tilt * 0.10 - table_loose * 0.35).clamp(0.0, 1.0);
+    let value_threshold_adjust = if read.samples == 0 {
+        0.0
+    } else {
+        (-table_loose * 0.12).clamp(-0.04, 0.03)
+    };
 
     // 1) 计算 equity。
-    let equity = if state.stage == Stage::Preflop {
+    let mut equity = if state.stage == Stage::Preflop {
         preflop_strength(hole)
     } else {
-        mc_equity(hole, &state.community, opponents, MC_ITERS, rng)
+        mc_equity(hole, &state.community, opponents, skill.mc_iters(), rng)
     };
+    let noise = skill.equity_noise();
+    if noise > 0.0 {
+        equity = (equity + rng.gen_range(-noise..=noise)).clamp(0.0, 1.0);
+    }
 
     // 2) 底池赔率（call 需要的最小 equity）。
     let pot_odds = if to_call == 0 {
@@ -72,52 +152,78 @@ pub fn decide_with_mood<R: Rng + ?Sized>(
 
     // ===== Preflop 入池决定 =====
     if state.stage == Stage::Preflop {
+        let range = preflop_range_plan(hole, persona, position_bonus, to_call > 0);
         let effective_vpip = (eff_vpip + position_bonus * 0.10).clamp(0.0, 1.0);
         let raise_threshold = preflop_strength_threshold(eff_pfr);
         let call_threshold = preflop_strength_threshold(effective_vpip);
 
         // 自由 BB option：to_call == 0
         if to_call == 0 {
-            if equity >= raise_threshold || rng.r#gen::<f64>() < eff_bluff * 0.5 {
+            if range.raise || equity >= raise_threshold || rng.r#gen::<f64>() < eff_bluff * 0.5 {
                 return raise_size(state, seat, persona, equity, eff_aggression, rng);
             }
             return Action::Check;
         }
 
         // 需要付钱才能进入
-        if equity >= raise_threshold {
+        if range.raise || equity >= raise_threshold {
             // 强牌：偶尔慢玩
             if rng.r#gen::<f64>() < persona.slowplay_freq * 0.5 {
-                return Action::Call;
+                return maybe_mistake(Action::Call, state, seat, rng, skill);
             }
-            return raise_size(state, seat, persona, equity, eff_aggression, rng);
+            return maybe_mistake(
+                raise_size(state, seat, persona, equity, eff_aggression, rng),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
-        if equity >= call_threshold {
+        if range.call || equity >= call_threshold {
             // 中等：跟注
-            return safe_call_or_fold(state, seat, to_call);
+            return maybe_mistake(
+                safe_call_or_fold(state, seat, to_call),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
         // 弱牌：偶尔诈唬，否则弃
         if rng.r#gen::<f64>() < eff_bluff * 0.5 && stack > to_call * 3 {
-            return raise_size(state, seat, persona, equity, eff_aggression, rng);
+            return maybe_mistake(
+                raise_size(state, seat, persona, equity, eff_aggression, rng),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
         return Action::Fold;
     }
 
     // ===== Postflop 决策 =====
     let is_aggressor_last_street = state.last_aggressor == Some(seat);
-    let scary_board = board_scariness(&state.community);
+    let texture = board_texture(&state.community);
+    let scary_board = texture.scariness;
 
     // 没人下注 → 选择 check / bet
     if to_call == 0 {
         // 强牌
-        if equity > 0.65 {
+        if equity > 0.65 + value_threshold_adjust {
             if rng.r#gen::<f64>() < persona.slowplay_freq {
                 return Action::Check;
             }
-            return open_bet(state, seat, persona, equity, eff_aggression, rng);
+            return maybe_mistake(
+                open_bet(state, seat, persona, equity, eff_aggression, rng),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
         // 中等牌
-        if equity > 0.45 {
+        if equity > 0.45 + value_threshold_adjust {
             // 多人池子要更保守
             if opponents >= 3 && equity < 0.55 {
                 return Action::Check;
@@ -125,18 +231,30 @@ pub fn decide_with_mood<R: Rng + ?Sized>(
             // value bet 频率随 aggression 增长
             let bet_p = (0.35 * eff_aggression).clamp(0.0, 0.9);
             if rng.r#gen::<f64>() < bet_p {
-                return open_bet(state, seat, persona, equity, eff_aggression, rng);
+                return maybe_mistake(
+                    open_bet(state, seat, persona, equity, eff_aggression, rng),
+                    state,
+                    seat,
+                    rng,
+                    skill,
+                );
             }
             return Action::Check;
         }
         // 弱牌：cbet 或 bluff
         let cbet_chance = if is_aggressor_last_street {
-            persona.cbet_freq
+            (persona.cbet_freq + texture.cbet_adjust).clamp(0.05, 0.95)
         } else {
             eff_bluff * (1.0 + scary_board)
         };
         if rng.r#gen::<f64>() < cbet_chance {
-            return open_bet(state, seat, persona, equity.max(0.30), eff_aggression, rng);
+            return maybe_mistake(
+                open_bet(state, seat, persona, equity.max(0.30), eff_aggression, rng),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
         return Action::Check;
     }
@@ -145,26 +263,62 @@ pub fn decide_with_mood<R: Rng + ?Sized>(
     // 强牌
     if edge > 0.20 {
         if rng.r#gen::<f64>() < persona.slowplay_freq * 0.5 {
-            return safe_call_or_fold(state, seat, to_call);
+            return maybe_mistake(
+                safe_call_or_fold(state, seat, to_call),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
-        return raise_size(state, seat, persona, equity, eff_aggression, rng);
+        return maybe_mistake(
+            raise_size(state, seat, persona, equity, eff_aggression, rng),
+            state,
+            seat,
+            rng,
+            skill,
+        );
     }
     // 有正期望
     if edge > 0.05 {
         // aggression 大 → 偏向加注
         let raise_p = (0.30 * eff_aggression).clamp(0.0, 0.85);
         if rng.r#gen::<f64>() < raise_p {
-            return raise_size(state, seat, persona, equity, eff_aggression, rng);
+            return maybe_mistake(
+                raise_size(state, seat, persona, equity, eff_aggression, rng),
+                state,
+                seat,
+                rng,
+                skill,
+            );
         }
-        return safe_call_or_fold(state, seat, to_call);
+        return maybe_mistake(
+            safe_call_or_fold(state, seat, to_call),
+            state,
+            seat,
+            rng,
+            skill,
+        );
     }
     // 边际：偶尔跟
     if edge > -0.05 {
-        return safe_call_or_fold(state, seat, to_call);
+        return maybe_mistake(
+            safe_call_or_fold(state, seat, to_call),
+            state,
+            seat,
+            rng,
+            skill,
+        );
     }
     // 烂牌：偶尔诈唬加注
     if rng.r#gen::<f64>() < eff_bluff * (0.5 + 0.5 * scary_board) {
-        return raise_size(state, seat, persona, 0.45, eff_aggression, rng);
+        return maybe_mistake(
+            raise_size(state, seat, persona, 0.45, eff_aggression, rng),
+            state,
+            seat,
+            rng,
+            skill,
+        );
     }
     Action::Fold
 }
@@ -179,14 +333,17 @@ fn preflop_strength_threshold(freq: f64) -> f64 {
 fn raise_size<R: Rng + ?Sized>(
     state: &HandState,
     seat: usize,
-    _persona: Personality,
+    persona: Personality,
     equity: f64,
     eff_aggression: f64,
     _rng: &mut R,
 ) -> Action {
     let pot = state.total_pot().max(state.bb);
+    let texture = board_texture(&state.community);
     // 基础尺度：equity 越高/aggression 越高，下注越大。
-    let scale = ((equity - 0.35).max(0.0) * 1.5 + 0.5) * (0.7 + 0.3 * eff_aggression);
+    let scale = ((equity - 0.35).max(0.0) * 1.5 + 0.5)
+        * (0.7 + 0.3 * eff_aggression)
+        * persona_sizing_factor(persona, state.stage, texture);
     let mut target_total: u64 = if state.current_bet == 0 {
         // open bet
         ((pot as f64) * scale.clamp(0.4, 1.2)) as u64
@@ -210,6 +367,9 @@ fn raise_size<R: Rng + ?Sized>(
     // 需要付的金额
     let need_pay = target_total.saturating_sub(state.players[seat].committed_round);
     let stack = state.players[seat].stack;
+    if persona.label == "ShortStacker" && stack <= pot.saturating_mul(2) {
+        return Action::AllIn;
+    }
     if need_pay >= stack {
         return Action::AllIn;
     }
@@ -229,6 +389,26 @@ fn safe_call_or_fold(state: &HandState, seat: usize, to_call: u64) -> Action {
         Action::AllIn
     } else {
         Action::Call
+    }
+}
+
+fn maybe_mistake<R: Rng + ?Sized>(
+    action: Action,
+    state: &HandState,
+    seat: usize,
+    rng: &mut R,
+    skill: SkillLevel,
+) -> Action {
+    if rng.r#gen::<f64>() >= skill.mistake_rate() {
+        return action;
+    }
+    let to_call = state.to_call_for(seat);
+    if to_call == 0 {
+        Action::Check
+    } else if matches!(action, Action::Fold) {
+        safe_call_or_fold(state, seat, to_call)
+    } else {
+        Action::Fold
     }
 }
 
@@ -261,10 +441,17 @@ fn position_weight(state: &HandState, seat: usize, awareness: f64) -> f64 {
     w.clamp(-0.10, 0.10)
 }
 
-/// 板面“可怕度” ∈ [0,1]：包含同花、顺子可能性的粗略指标。
-fn board_scariness(board: &[crate::card::Card]) -> f64 {
+#[derive(Debug, Clone, Copy, Default)]
+struct BoardTexture {
+    scariness: f64,
+    cbet_adjust: f64,
+    wet_sizing: f64,
+}
+
+/// 板面 texture：干燥牌面更适合小额 cbet，湿润牌面更需要保护和谨慎诈唬。
+fn board_texture(board: &[crate::card::Card]) -> BoardTexture {
     if board.len() < 3 {
-        return 0.0;
+        return BoardTexture::default();
     }
     let mut suits = [0u8; 4];
     for c in board {
@@ -276,6 +463,10 @@ fn board_scariness(board: &[crate::card::Card]) -> f64 {
         3 => 0.25,
         _ => 0.0,
     };
+    let paired = board
+        .iter()
+        .enumerate()
+        .any(|(i, c)| board.iter().skip(i + 1).any(|o| c.rank() == o.rank()));
     // 简单连通度：rank 集合排序后看最大窗口内 5 个 rank 中有多少
     let mut ranks: Vec<u8> = board.iter().map(|c| c.rank().as_u8()).collect();
     ranks.sort_unstable();
@@ -289,7 +480,121 @@ fn board_scariness(board: &[crate::card::Card]) -> f64 {
         }
     }
     let straight_threat = (max_in_window as f64 - 2.0).max(0.0) * 0.15;
-    (flush_threat + straight_threat).clamp(0.0, 1.0)
+    let scariness = (flush_threat + straight_threat).clamp(0.0, 1.0);
+    let wet_sizing = (1.0 + scariness * 0.35).clamp(1.0, 1.35);
+    let cbet_adjust = if paired {
+        0.08
+    } else if scariness < 0.25 {
+        0.10
+    } else if scariness > 0.55 {
+        -0.12
+    } else {
+        0.0
+    };
+    BoardTexture {
+        scariness,
+        cbet_adjust,
+        wet_sizing,
+    }
+}
+
+fn persona_sizing_factor(persona: Personality, stage: Stage, texture: BoardTexture) -> f64 {
+    let base = match persona.label {
+        "Nit" | "WeakTight" => 0.82,
+        "Rock" => 0.90,
+        "Station" | "Fish" => 0.75,
+        "Maniac" | "Gambler" => 1.25,
+        "Bluffer" => 1.15,
+        "ShortStacker" => 1.35,
+        "Pro" | "BalancedReg" | "Shark" => 1.0,
+        _ => 1.0,
+    };
+    let street = if stage == Stage::Preflop {
+        0.95
+    } else {
+        texture.wet_sizing
+    };
+    (base * street).clamp(0.55, 1.60)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreflopPlan {
+    raise: bool,
+    call: bool,
+}
+
+fn preflop_range_plan(
+    hole: [Card; 2],
+    persona: Personality,
+    position_bonus: f64,
+    facing_raise: bool,
+) -> PreflopPlan {
+    let score = preflop_range_score(hole);
+    let late_bonus = (position_bonus * 2.0).clamp(-0.10, 0.18);
+    let (open, defend) = match persona.label {
+        "Nit" => (0.86, 0.80),
+        "Rock" | "WeakTight" => (0.78, 0.70),
+        "Shark" | "Pro" | "BalancedReg" => (0.66, 0.58),
+        "Trapper" => (0.72, 0.64),
+        "Bluffer" => (0.58, 0.50),
+        "Maniac" | "Gambler" => (0.46, 0.40),
+        "Fish" | "Station" => (0.82, 0.42),
+        "ShortStacker" => (0.70, 0.62),
+        _ => (0.68, 0.58),
+    };
+    let open_threshold = (open - late_bonus).clamp(0.25, 0.95);
+    let defend_threshold = (defend - late_bonus * 0.5).clamp(0.25, 0.92);
+    if facing_raise {
+        PreflopPlan {
+            raise: score >= (defend_threshold + 0.22).clamp(0.65, 0.97),
+            call: score >= defend_threshold,
+        }
+    } else {
+        PreflopPlan {
+            raise: score >= open_threshold,
+            call: score >= defend_threshold,
+        }
+    }
+}
+
+fn preflop_range_score(hole: [Card; 2]) -> f64 {
+    let (hi, lo) = ordered_ranks(hole);
+    let suited = hole[0].suit() == hole[1].suit();
+    let pair = hi == lo;
+    if pair {
+        return 0.52 + hi.as_u8() as f64 / 12.0 * 0.48;
+    }
+    let gap = hi.as_u8() - lo.as_u8();
+    let broadway = hi >= Rank::Ten && lo >= Rank::Ten;
+    let ace = hi == Rank::Ace;
+    let connector = gap <= 2;
+    let mut score = 0.18 + hi.as_u8() as f64 / 12.0 * 0.34 + lo.as_u8() as f64 / 12.0 * 0.16;
+    if suited {
+        score += 0.10;
+    }
+    if broadway {
+        score += 0.10;
+    }
+    if ace {
+        score += if suited { 0.09 } else { 0.04 };
+    }
+    if connector {
+        score += 0.07;
+    } else if gap <= 4 && suited {
+        score += 0.03;
+    }
+    if gap >= 6 && !ace {
+        score -= 0.08;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn ordered_ranks(hole: [Card; 2]) -> (Rank, Rank) {
+    if hole[0].rank() >= hole[1].rank() {
+        (hole[0].rank(), hole[1].rank())
+    } else {
+        (hole[1].rank(), hole[0].rank())
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +618,11 @@ mod tests {
     fn rock_folds_trash_preflop_facing_raise() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut s = start_hand(
-            vec![Player::new("A", 1000), Player::new("B", 1000), Player::new("C", 1000)],
+            vec![
+                Player::new("A", 1000),
+                Player::new("B", 1000),
+                Player::new("C", 1000),
+            ],
             0,
             5,
             10,
@@ -337,7 +646,11 @@ mod tests {
     fn maniac_raises_premium() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(2);
         let mut s = start_hand(
-            vec![Player::new("A", 1000), Player::new("B", 1000), Player::new("C", 1000)],
+            vec![
+                Player::new("A", 1000),
+                Player::new("B", 1000),
+                Player::new("C", 1000),
+            ],
             0,
             5,
             10,
@@ -353,7 +666,11 @@ mod tests {
     fn fish_calls_with_marginal() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         let mut s = start_hand(
-            vec![Player::new("A", 1000), Player::new("B", 1000), Player::new("C", 1000)],
+            vec![
+                Player::new("A", 1000),
+                Player::new("B", 1000),
+                Player::new("C", 1000),
+            ],
             0,
             5,
             10,

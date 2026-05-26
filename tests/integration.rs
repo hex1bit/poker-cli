@@ -32,7 +32,7 @@ fn six_bots_play_30_hands_chip_conservation() {
         let mut steps = 0usize;
         while state.stage != Stage::Complete && state.stage != Stage::Showdown {
             if let Some(seat) = state.to_act {
-                let p = Personality::PRESETS[seat % 6];
+                let p = Personality::PRESETS[seat % Personality::PRESETS.len()];
                 let a = decide(&state, seat, p, &mut rng);
                 apply_action(&mut state, seat, a).expect("legal");
             } else if round_closed(&state) {

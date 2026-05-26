@@ -44,7 +44,11 @@ impl Rank {
     ];
 
     pub fn from_u8(v: u8) -> Option<Rank> {
-        if v < 13 { Some(Self::ALL[v as usize]) } else { None }
+        if v < 13 {
+            Some(Self::ALL[v as usize])
+        } else {
+            None
+        }
     }
 
     pub fn as_u8(self) -> u8 {
@@ -90,7 +94,11 @@ impl Suit {
     pub const ALL: [Suit; 4] = [Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades];
 
     pub fn from_u8(v: u8) -> Option<Suit> {
-        if v < 4 { Some(Self::ALL[v as usize]) } else { None }
+        if v < 4 {
+            Some(Self::ALL[v as usize])
+        } else {
+            None
+        }
     }
 
     pub fn as_u8(self) -> u8 {
@@ -155,7 +163,7 @@ impl fmt::Display for Card {
 
 /// 一副完整 52 张牌（顺序固定）。
 pub fn full_deck() -> Vec<Card> {
-    (0..52).map(|i| Card(i)).collect()
+    (0..52).map(Card).collect()
 }
 
 /// 洗好的一副牌。

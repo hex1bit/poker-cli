@@ -103,6 +103,69 @@ pub fn lines_for(persona: &Personality, ev: VoiceEvent) -> &'static [&'static st
         ("Bluffer", Folded) => &["演不下去", "保留实力"],
         ("Bluffer", AllIn) => &["all in 你跟不跟", "压上戏份", "谁怕谁"],
 
+        // ===== Nit 超紧 =====
+        ("Nit", OpenRaise) => &["范围很窄", "这手可以", "难得参与"],
+        ("Nit", WonShowdown) => &["标准结果", "只打好牌", "没什么意外"],
+        ("Nit", LostShowdown) => &["这也能输", "样本太小", "下次更紧"],
+        ("Nit", WonUncontested) => &["正常", "弃得对"],
+        ("Nit", TiltOn) => &["我要再收紧一点", "风险超标"],
+        ("Nit", Folded) => &["不够好", "继续等"],
+        ("Nit", AllIn) => &["没退路了", "只有这手"],
+
+        // ===== Station 跟注站 =====
+        ("Station", OpenRaise) => &["偶尔来一下", "我也加一次"],
+        ("Station", WonShowdown) => &["看吧，跟到了", "我就说能中", "不信邪有用"],
+        ("Station", LostShowdown) => &["再看一张就好了", "我以为你没有", "跟得有点远"],
+        ("Station", WonUncontested) => &["这就不跟了？", "我还想看牌呢"],
+        ("Station", TiltOn) => &["我今天必须看河牌", "别想吓我"],
+        ("Station", Folded) => &["这次真算了", "太贵了"],
+        ("Station", AllIn) => &["我跟到底", "摊牌吧"],
+
+        // ===== Pro 职业型 =====
+        ("Pro", OpenRaise) => &["标准开局", "位置不错", "压力给上"],
+        ("Pro", WonShowdown) => &["范围判断没错", "价值拿满", "结果合理"],
+        ("Pro", LostShowdown) => &["线没问题", "下次调整", "记下频率"],
+        ("Pro", WonUncontested) => &["弃牌率够高", "拿下"],
+        ("Pro", TiltOn) => &["保持纪律", "不被结果影响"],
+        ("Pro", Folded) => &["这手到此为止", "范围不支持"],
+        ("Pro", AllIn) => &["最大压力", "到决策点了"],
+
+        // ===== Gambler 赌徒 =====
+        ("Gambler", OpenRaise) => &["今天手气不错", "翻倍机会", "敢不敢一起"],
+        ("Gambler", WonShowdown) => &["赌对了", "手气也是实力", "这就是命"],
+        ("Gambler", LostShowdown) => &["差一点翻倍", "再来一把", "牌运不站我这边"],
+        ("Gambler", WonUncontested) => &["不敢赌啊", "收了收了"],
+        ("Gambler", TiltOn) => &["下一把翻回来", "我要追一下"],
+        ("Gambler", Folded) => &["这把不押", "等个大机会"],
+        ("Gambler", AllIn) => &["一把定输赢", "翻倍就在现在"],
+
+        // ===== WeakTight 紧弱 =====
+        ("WeakTight", OpenRaise) => &["应该能打吧", "小心一点加"],
+        ("WeakTight", WonShowdown) => &["还好还好", "幸亏没弃", "稳住了"],
+        ("WeakTight", LostShowdown) => &["早知道弃了", "太危险了", "我不该跟"],
+        ("WeakTight", WonUncontested) => &["没人跟最好", "安全拿下"],
+        ("WeakTight", TiltOn) => &["我得冷静", "不能再乱跟了"],
+        ("WeakTight", Folded) => &["算了", "不冒险"],
+        ("WeakTight", AllIn) => &["只能这样了", "有点慌"],
+
+        // ===== BalancedReg 均衡常规玩家 =====
+        ("BalancedReg", OpenRaise) => &["标准开池", "范围覆盖一下", "位置可以"],
+        ("BalancedReg", WonShowdown) => &["执行到位", "赔率合适", "这手合理"],
+        ("BalancedReg", LostShowdown) => &["样本而已", "线可以优化", "下次调整频率"],
+        ("BalancedReg", WonUncontested) => &["弃牌率够", "拿下小池"],
+        ("BalancedReg", TiltOn) => &["不要偏离策略", "继续按范围来"],
+        ("BalancedReg", Folded) => &["范围外", "弃牌没问题"],
+        ("BalancedReg", AllIn) => &["权益够了", "压力给满"],
+
+        // ===== ShortStacker 短码推压 =====
+        ("ShortStacker", OpenRaise) => &["筹码浅，简单点", "直接给压力"],
+        ("ShortStacker", WonShowdown) => &["翻倍成功", "短码也能打", "刚好够用"],
+        ("ShortStacker", LostShowdown) => &["短码命", "没转起来", "下次推准点"],
+        ("ShortStacker", WonUncontested) => &["偷到就行", "盲注也是钱"],
+        ("ShortStacker", TiltOn) => &["再找个翻倍点", "不能等死"],
+        ("ShortStacker", Folded) => &["不是推点", "再等一圈"],
+        ("ShortStacker", AllIn) => &["推了", "十盲不等人"],
+
         _ => &[],
     }
 }
@@ -127,12 +190,7 @@ mod tests {
         for p in Personality::PRESETS.iter() {
             for ev in events {
                 let lines = lines_for(p, ev);
-                assert!(
-                    !lines.is_empty(),
-                    "{} × {:?} has no lines",
-                    p.label,
-                    ev
-                );
+                assert!(!lines.is_empty(), "{} × {:?} has no lines", p.label, ev);
                 for l in lines {
                     assert!(!l.is_empty());
                 }

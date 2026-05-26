@@ -23,51 +23,74 @@ pub fn mc_equity<R: Rng + ?Sized>(
     assert!(community.len() <= 5, "community size must be ≤ 5");
     assert!(opponents >= 1, "need at least 1 opponent");
 
-    // 构造剩余牌池
-    let mut used = [false; 52];
-    used[hero[0].index() as usize] = true;
-    used[hero[1].index() as usize] = true;
+    // 构造剩余牌池：u64 位图 + 栈数组，零堆分配
+    let mut used: u64 = 0;
+    used |= 1u64 << hero[0].index();
+    used |= 1u64 << hero[1].index();
     for c in community {
-        used[c.index() as usize] = true;
+        used |= 1u64 << c.index();
     }
-    let pool: Vec<Card> = (0..52u8)
-        .filter(|&i| !used[i as usize])
-        .map(|i| Card::from_index(i).unwrap())
-        .collect();
+
+    let placeholder = Card::from_index(0).unwrap();
+    let mut pool_buf = [placeholder; 52];
+    let mut pool_len: usize = 0;
+    for i in 0..52u8 {
+        if used & (1u64 << i) == 0 {
+            pool_buf[pool_len] = Card::from_index(i).unwrap();
+            pool_len += 1;
+        }
+    }
+    let pool = &mut pool_buf[..pool_len];
 
     let need_community = 5 - community.len();
     let need_opp = opponents * 2;
     let need_total = need_community + need_opp;
     assert!(pool.len() >= need_total, "not enough cards for simulation");
 
+    // 公共牌前缀拷到 board，后续每次只填后缀
+    let mut board = [placeholder; 5];
+    for (i, c) in community.iter().enumerate() {
+        board[i] = *c;
+    }
+
+    // River：hero 牌力固定，外提
+    let hero_rank_fixed = if need_community == 0 {
+        Some(evaluate_7(&[
+            hero[0], hero[1], board[0], board[1], board[2], board[3], board[4],
+        ]))
+    } else {
+        None
+    };
+
     let mut wins = 0.0f64;
-    let mut scratch = pool.clone();
 
     for _ in 0..iters {
         // Fisher-Yates 部分洗：只洗前 need_total 张
-        partial_shuffle(&mut scratch, need_total, rng);
+        partial_shuffle(pool, need_total, rng);
 
-        // 拼公共牌
-        let mut board = [Card::from_index(0).unwrap(); 5];
-        for (i, c) in community.iter().enumerate() {
-            board[i] = *c;
-        }
         for i in 0..need_community {
-            board[community.len() + i] = scratch[i];
+            board[community.len() + i] = pool[i];
         }
 
-        let hero_rank = evaluate_7(&[
-            hero[0], hero[1], board[0], board[1], board[2], board[3], board[4],
-        ]);
+        let hero_rank = match hero_rank_fixed {
+            Some(r) => r,
+            None => evaluate_7(&[
+                hero[0], hero[1], board[0], board[1], board[2], board[3], board[4],
+            ]),
+        };
 
-        // 对每个对手，取走 2 张并评估
         let mut best_opp: Option<HandRank> = None;
         let mut tied_with_best = 0u32;
         for o in 0..opponents {
             let i = need_community + o * 2;
-            let opp = [scratch[i], scratch[i + 1]];
             let r = evaluate_7(&[
-                opp[0], opp[1], board[0], board[1], board[2], board[3], board[4],
+                pool[i],
+                pool[i + 1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
             ]);
             match best_opp {
                 None => {
@@ -88,10 +111,8 @@ pub fn mc_equity<R: Rng + ?Sized>(
         if hero_rank > best_opp {
             wins += 1.0;
         } else if hero_rank == best_opp {
-            // hero ties with the best opponent group; split among (tied_with_best + 1) winners
             wins += 1.0 / (tied_with_best as f64 + 1.0);
         }
-        // 否则 hero 不分池
     }
 
     wins / iters as f64
@@ -240,14 +261,16 @@ mod tests {
         let hero = [c(Rank::Ace, Suit::Hearts), c(Rank::Ace, Suit::Spades)];
         let e1 = mc_equity(hero, &[], 1, 2000, &mut rng);
         let e5 = mc_equity(hero, &[], 5, 2000, &mut rng);
-        assert!(e1 > e5, "more opponents should reduce equity, got e1={e1} e5={e5}");
+        assert!(
+            e1 > e5,
+            "more opponents should reduce equity, got e1={e1} e5={e5}"
+        );
     }
 
     #[test]
     fn preflop_strength_order() {
         let aa = preflop_strength([c(Rank::Ace, Suit::Hearts), c(Rank::Ace, Suit::Spades)]);
-        let twos =
-            preflop_strength([c(Rank::Two, Suit::Hearts), c(Rank::Two, Suit::Spades)]);
+        let twos = preflop_strength([c(Rank::Two, Suit::Hearts), c(Rank::Two, Suit::Spades)]);
         let trash = preflop_strength([c(Rank::Seven, Suit::Hearts), c(Rank::Two, Suit::Spades)]);
         let aks = preflop_strength([c(Rank::Ace, Suit::Hearts), c(Rank::King, Suit::Hearts)]);
         assert!(aa > aks);

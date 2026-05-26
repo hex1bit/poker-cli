@@ -79,6 +79,18 @@ impl Stage {
             Stage::Complete => Stage::Complete,
         }
     }
+
+    /// 用于 UI 展示的中文阶段名。
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Stage::Preflop => "翻牌前",
+            Stage::Flop => "翻牌",
+            Stage::Turn => "转牌",
+            Stage::River => "河牌",
+            Stage::Showdown => "摊牌",
+            Stage::Complete => "结束",
+        }
+    }
 }
 
 /// 一手牌的完整状态。
@@ -122,6 +134,7 @@ impl HandState {
 
     /// 给定玩家需要 call 多少。
     pub fn to_call_for(&self, idx: usize) -> u64 {
-        self.current_bet.saturating_sub(self.players[idx].committed_round)
+        self.current_bet
+            .saturating_sub(self.players[idx].committed_round)
     }
 }

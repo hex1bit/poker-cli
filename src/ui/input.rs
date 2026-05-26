@@ -5,10 +5,9 @@
 use std::io::{Write, stdout};
 
 use crossterm::{
-    cursor,
+    QueueableCommand, cursor,
     event::{Event, KeyCode, read},
     style::{Color, ResetColor, SetForegroundColor},
-    QueueableCommand,
 };
 
 use crate::game::action::Action;
@@ -22,21 +21,7 @@ pub fn prompt_action(state: &HandState, seat: usize) -> std::io::Result<Action> 
     let can_check = to_call == 0;
 
     let mut out = stdout();
-    out.queue(SetForegroundColor(Color::Cyan))?;
-    if can_check {
-        write!(
-            out,
-            "  Your move: [F]old  [K]check  [R]aise  [A]ll-in  (Esc to quit) > "
-        )?;
-    } else {
-        write!(
-            out,
-            "  Your move: [F]old  [C]all ${}  [R]aise  [A]ll-in  (Esc to quit) > ",
-            to_call.min(stack)
-        )?;
-    }
-    out.queue(ResetColor)?;
-    out.flush()?;
+    write_action_menu(&mut out, can_check, to_call.min(stack))?;
 
     loop {
         if let Event::Key(k) = read()? {
@@ -44,7 +29,12 @@ pub fn prompt_action(state: &HandState, seat: usize) -> std::io::Result<Action> 
                 KeyCode::Char('f') | KeyCode::Char('F') => return Ok(Action::Fold),
                 KeyCode::Char('k') | KeyCode::Char('K') if can_check => return Ok(Action::Check),
                 KeyCode::Char('c') | KeyCode::Char('C') if !can_check => return Ok(Action::Call),
-                KeyCode::Char('a') | KeyCode::Char('A') => return Ok(Action::AllIn),
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    if confirm_allin(state, seat)? {
+                        return Ok(Action::AllIn);
+                    }
+                    write_action_menu(&mut out, can_check, to_call.min(stack))?;
+                }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     let amt = prompt_raise_amount(state, seat)?;
                     if let Some(total) = amt {
@@ -55,10 +45,7 @@ pub fn prompt_action(state: &HandState, seat: usize) -> std::io::Result<Action> 
                         }
                     }
                     // 取消 raise 弹窗回到选项
-                    out.queue(SetForegroundColor(Color::Cyan))?;
-                    write!(out, "  (cancel) > ")?;
-                    out.queue(ResetColor)?;
-                    out.flush()?;
+                    write_action_menu(&mut out, can_check, to_call.min(stack))?;
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                     return Err(std::io::Error::new(
@@ -72,22 +59,88 @@ pub fn prompt_action(state: &HandState, seat: usize) -> std::io::Result<Action> 
     }
 }
 
+fn write_action_menu<W: Write + QueueableCommand>(
+    out: &mut W,
+    can_check: bool,
+    to_call_chips: u64,
+) -> std::io::Result<()> {
+    out.queue(cursor::MoveToNextLine(1))?;
+    out.queue(SetForegroundColor(Color::Cyan))?;
+    if can_check {
+        write!(
+            out,
+            "  Your move: [F]old  [K]check  [R]aise  [A]ll-in  (Esc to quit) > "
+        )?;
+    } else {
+        write!(
+            out,
+            "  Your move: [F]old  [C]all ${}  [R]aise  [A]ll-in  (Esc to quit) > ",
+            to_call_chips
+        )?;
+    }
+    out.queue(ResetColor)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// 全押二次确认：再按一次 A 提交，其他键取消。
+fn confirm_allin(state: &HandState, seat: usize) -> std::io::Result<bool> {
+    let total = state.players[seat].committed_round + state.players[seat].stack;
+    let mut out = stdout();
+    out.queue(cursor::MoveToNextLine(1))?;
+    out.queue(SetForegroundColor(Color::Red))?;
+    write!(
+        out,
+        "  [!] Confirm ALL-IN to ${} ? Press [A] again, any other key cancels > ",
+        total
+    )?;
+    out.queue(ResetColor)?;
+    out.flush()?;
+    loop {
+        if let Event::Key(k) = read()? {
+            return Ok(matches!(k.code, KeyCode::Char('a') | KeyCode::Char('A')));
+        }
+    }
+}
+
 /// 弹窗读取 raise 总额；返回 None 表示用户取消。
+///
+/// 支持空 buffer 时一键尺寸：
+///   M = min raise / X = max (all-in)
+///   H = ½ pot / T = ⅔ pot / P = pot / O = 2× pot
 fn prompt_raise_amount(state: &HandState, seat: usize) -> std::io::Result<Option<u64>> {
     let min_total = if state.current_bet == 0 {
         state.bb
     } else {
         state.current_bet + state.min_raise
     };
-    let max_total = state.players[seat].committed_round + state.players[seat].stack;
+    let cur_round = state.players[seat].committed_round;
+    let max_total = cur_round + state.players[seat].stack;
+    // 估算"call 之后"的底池，用于按比例计算 raise 尺寸。
+    let to_call = state.current_bet.saturating_sub(cur_round);
+    let pot_after_call = state.total_pot() + to_call;
+    let cur_bet = state.current_bet;
+    let bb = state.bb;
+    let preset = |target: u64| target.clamp(min_total, max_total);
+    let half_pot = preset(cur_bet.max(bb) + pot_after_call / 2);
+    let two_thirds = preset(cur_bet.max(bb) + pot_after_call * 2 / 3);
+    let pot_size = preset(cur_bet.max(bb) + pot_after_call);
+    let over_pot = preset(cur_bet.max(bb) + pot_after_call * 2);
 
     let mut out = stdout();
     out.queue(cursor::MoveToNextLine(1))?;
     out.queue(SetForegroundColor(Color::Yellow))?;
     write!(
         out,
-        "  Raise to amount (min ${} – max ${}, Enter to confirm, Esc to cancel): ",
-        min_total, max_total
+        "  Raise to (min ${} – max ${}): [M]min [H]½pot=${} [T]2/3pot=${} [P]pot=${} [O]2×pot=${} [X]all-in",
+        min_total, max_total, half_pot, two_thirds, pot_size, over_pot
+    )?;
+    out.queue(ResetColor)?;
+    out.queue(cursor::MoveToNextLine(1))?;
+    out.queue(SetForegroundColor(Color::Yellow))?;
+    write!(
+        out,
+        "    or type digits + Enter (Esc to cancel): "
     )?;
     out.queue(ResetColor)?;
     out.flush()?;
@@ -96,6 +149,25 @@ fn prompt_raise_amount(state: &HandState, seat: usize) -> std::io::Result<Option
     loop {
         if let Event::Key(k) = read()? {
             match k.code {
+                // 空 buffer 时的快捷键
+                KeyCode::Char('m') | KeyCode::Char('M') if buf.is_empty() => {
+                    return Ok(Some(min_total));
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') if buf.is_empty() => {
+                    return Ok(Some(max_total));
+                }
+                KeyCode::Char('h') | KeyCode::Char('H') if buf.is_empty() => {
+                    return Ok(Some(half_pot));
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') if buf.is_empty() => {
+                    return Ok(Some(two_thirds));
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') if buf.is_empty() => {
+                    return Ok(Some(pot_size));
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') if buf.is_empty() => {
+                    return Ok(Some(over_pot));
+                }
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     buf.push(c);
                     write!(out, "{c}")?;
@@ -109,15 +181,19 @@ fn prompt_raise_amount(state: &HandState, seat: usize) -> std::io::Result<Option
                 }
                 KeyCode::Enter => {
                     if let Ok(v) = buf.parse::<u64>() {
-                        if v >= min_total && v <= max_total {
-                            return Ok(Some(v));
+                        if v < min_total {
+                            invalid_hint(&mut out, &format!("too low (min ${min_total})"))?;
+                            buf.clear();
+                            continue;
                         }
+                        if v > max_total {
+                            invalid_hint(&mut out, &format!("too high (max ${max_total})"))?;
+                            buf.clear();
+                            continue;
+                        }
+                        return Ok(Some(v));
                     }
-                    // 非法：闪烁提示后继续
-                    out.queue(SetForegroundColor(Color::Red))?;
-                    write!(out, " ← invalid, retry: ")?;
-                    out.queue(ResetColor)?;
-                    out.flush()?;
+                    invalid_hint(&mut out, "invalid number")?;
                     buf.clear();
                 }
                 KeyCode::Esc => return Ok(None),
@@ -125,4 +201,12 @@ fn prompt_raise_amount(state: &HandState, seat: usize) -> std::io::Result<Option
             }
         }
     }
+}
+
+fn invalid_hint<W: Write + QueueableCommand>(out: &mut W, msg: &str) -> std::io::Result<()> {
+    out.queue(SetForegroundColor(Color::Red))?;
+    write!(out, " ← {msg}, retry: ")?;
+    out.queue(ResetColor)?;
+    out.flush()?;
+    Ok(())
 }

@@ -4,9 +4,11 @@ pub mod decision;
 pub mod mood;
 pub mod names;
 pub mod personality;
+pub mod skill;
 pub mod voice;
 
 pub use decision::decide;
 pub use mood::Mood;
 pub use personality::Personality;
+pub use skill::SkillLevel;
 pub use voice::{VoiceEvent, pick_line};

@@ -13,7 +13,23 @@ use crossterm::{
 };
 
 use crate::card::Card;
+use crate::config::Layout;
 use crate::game::state::{HandState, PlayerStatus};
+use crate::hand_eval::describe_hero;
+
+const SQUARE_CELL_WIDTH: usize = 17;
+const SQUARE_CENTER_WIDTH: usize = 32;
+
+#[derive(Clone, Copy)]
+pub struct RenderOptions<'a> {
+    pub hero_seat: Option<usize>,
+    pub log: &'a [String],
+    pub reveal_all: bool,
+    pub winners: &'a [usize],
+    pub tilt_marks: &'a [bool],
+    pub hud: Option<&'a [String]>,
+    pub layout: Layout,
+}
 
 /// 移到下一行行首（raw mode 友好）。
 fn nl<W: Write + QueueableCommand>(out: &mut W) -> std::io::Result<()> {
@@ -23,14 +39,16 @@ fn nl<W: Write + QueueableCommand>(out: &mut W) -> std::io::Result<()> {
 
 /// 渲染当前牌局。`hero_seat` = 真人座位下标；`reveal_all` 在摊牌时为 true，显示所有人手牌。
 /// `winners` 列表中的座位会高亮成绿色；`tilt_marks[seat]` 为 true 时该 bot 行尾显示 [T]。
-pub fn render(
-    state: &HandState,
-    hero_seat: Option<usize>,
-    log: &[String],
-    reveal_all: bool,
-    winners: &[usize],
-    tilt_marks: &[bool],
-) -> std::io::Result<()> {
+pub fn render(state: &HandState, opts: RenderOptions<'_>) -> std::io::Result<()> {
+    if opts.layout == Layout::Square {
+        return render_square(state, opts);
+    }
+    let hero_seat = opts.hero_seat;
+    let log = opts.log;
+    let reveal_all = opts.reveal_all;
+    let winners = opts.winners;
+    let tilt_marks = opts.tilt_marks;
+    let hud = opts.hud;
     let mut out = stdout();
     out.queue(Clear(ClearType::All))?;
     out.queue(cursor::MoveTo(0, 0))?;
@@ -43,11 +61,7 @@ pub fn render(
     } else {
         None
     };
-    write!(
-        out,
-        "Texas Hold'em — {:?}   Pot ",
-        state.stage,
-    )?;
+    write!(out, "Texas Hold'em — {}   Pot ", state.stage.label_zh(),)?;
     if let Some(c) = pot_color {
         out.queue(SetForegroundColor(c))?;
     }
@@ -55,7 +69,11 @@ pub fn render(
     if pot_color.is_some() {
         out.queue(ResetColor)?;
     }
-    write!(out, "   Bet ${}   MinRaise ${}", state.current_bet, state.min_raise)?;
+    write!(
+        out,
+        "   Bet ${}   MinRaise ${}",
+        state.current_bet, state.min_raise
+    )?;
     nl(&mut out)?;
     write!(out, "Board: ")?;
     if state.community.is_empty() {
@@ -67,14 +85,39 @@ pub fn render(
         }
     }
     nl(&mut out)?;
+    if let Some(seat) = hero_seat
+        && state.community.len() >= 3
+        && state.players[seat].status != PlayerStatus::Folded
+        && let Some(hole) = state.players[seat].hole
+        && let Some(desc) = describe_hero(hole, &state.community)
+    {
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, "Your: ")?;
+        write_card(&mut out, hole[0])?;
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, " ")?;
+        write_card(&mut out, hole[1])?;
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, " → {desc}")?;
+        out.queue(ResetColor)?;
+        nl(&mut out)?;
+    }
     nl(&mut out)?;
 
     // 玩家表（普通对齐列）
-    write!(
-        out,
-        "    {:<3} {:<3} {:<10} {:>7}  {:<13} {}",
-        "#", "POS", "Name", "Stack", "Status", "Hole"
-    )?;
+    if hud.is_some() {
+        write!(
+            out,
+            "    {:<3} {:<3} {:<10} {:>7}  {:<13} {:<17} Hole",
+            "#", "POS", "Name", "Stack", "Status", "HUD"
+        )?;
+    } else {
+        write!(
+            out,
+            "    {:<3} {:<3} {:<10} {:>7}  {:<13} Hole",
+            "#", "POS", "Name", "Stack", "Status"
+        )?;
+    }
     nl(&mut out)?;
     for (i, p) in state.players.iter().enumerate() {
         let is_hero = Some(i) == hero_seat;
@@ -88,7 +131,7 @@ pub fn render(
             out.queue(SetForegroundColor(Color::Green))?;
         } else if is_acting {
             out.queue(SetForegroundColor(Color::Yellow))?;
-        } else if p.status == PlayerStatus::Folded {
+        } else if matches!(p.status, PlayerStatus::Folded | PlayerStatus::SitOut) {
             out.queue(SetForegroundColor(Color::DarkGrey))?;
         }
 
@@ -114,6 +157,10 @@ pub fn render(
             PlayerStatus::SitOut => "sit-out".to_string(),
         };
         write!(out, "{:<13} ", status)?;
+        if let Some(hud) = hud {
+            let text = hud.get(i).map(String::as_str).unwrap_or("VP-- PF-- AF--");
+            write!(out, "{:<17} ", text)?;
+        }
 
         // 手牌
         if let Some(hole) = p.hole {
@@ -154,6 +201,332 @@ pub fn render(
 
     out.flush()?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SquareCtx<'a> {
+    hero_seat: Option<usize>,
+    reveal_all: bool,
+    winners: &'a [usize],
+    tilt_marks: &'a [bool],
+    hud: Option<&'a [String]>,
+}
+
+struct SeatCell {
+    seat: Option<usize>,
+    lines: [String; 3],
+}
+
+fn render_square(state: &HandState, opts: RenderOptions<'_>) -> std::io::Result<()> {
+    let mut out = stdout();
+    out.queue(Clear(ClearType::All))?;
+    out.queue(cursor::MoveTo(0, 0))?;
+
+    write!(
+        out,
+        "Texas Hold'em — {}   Pot ${}   Bet ${}",
+        state.stage.label_zh(),
+        state.total_pot(),
+        state.current_bet
+    )?;
+    nl(&mut out)?;
+    write!(out, "Board: ")?;
+    if state.community.is_empty() {
+        write!(out, "—")?;
+    } else {
+        for c in &state.community {
+            write_card(&mut out, *c)?;
+            write!(out, " ")?;
+        }
+    }
+    nl(&mut out)?;
+    if let Some(seat) = opts.hero_seat
+        && state.community.len() >= 3
+        && state.players[seat].status != PlayerStatus::Folded
+        && let Some(hole) = state.players[seat].hole
+        && let Some(desc) = describe_hero(hole, &state.community)
+    {
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, "Your: ")?;
+        write_card(&mut out, hole[0])?;
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, " ")?;
+        write_card(&mut out, hole[1])?;
+        out.queue(SetForegroundColor(Color::Cyan))?;
+        write!(out, " → {desc}")?;
+        out.queue(ResetColor)?;
+        nl(&mut out)?;
+    }
+    nl(&mut out)?;
+
+    let bots: Vec<usize> = (1..state.players.len()).collect();
+    let top: Vec<Option<usize>> = fixed_slots(bots.iter().copied().take(4), 4);
+    let side: Vec<usize> = bots.iter().copied().skip(4).take(4).collect();
+    let rest: Vec<usize> = bots.iter().copied().skip(8).collect();
+    let bottom = [None, Some(0), rest.first().copied(), rest.get(1).copied()];
+
+    let ctx = SquareCtx {
+        hero_seat: opts.hero_seat,
+        reveal_all: opts.reveal_all,
+        winners: opts.winners,
+        tilt_marks: opts.tilt_marks,
+        hud: opts.hud,
+    };
+
+    write_seat_strip(&mut out, state, ctx, &top)?;
+    write_center_border(&mut out)?;
+    nl(&mut out)?;
+    for row in 0..2 {
+        let left = side.get(row).copied();
+        let right = side.get(row + 2).copied();
+        write_side_row(&mut out, state, ctx, left, right, row)?;
+    }
+    write_center_border(&mut out)?;
+    nl(&mut out)?;
+    write_seat_strip(&mut out, state, ctx, &bottom)?;
+
+    nl(&mut out)?;
+    let take = opts.log.len().saturating_sub(8);
+    for line in &opts.log[take..] {
+        out.queue(SetForegroundColor(Color::DarkGrey))?;
+        write!(out, "  · ")?;
+        out.queue(ResetColor)?;
+        write!(out, "{line}")?;
+        nl(&mut out)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn write_center_border<W: Write + QueueableCommand>(out: &mut W) -> std::io::Result<()> {
+    write!(
+        out,
+        "  {}  +{:-<width$}+  {}",
+        " ".repeat(SQUARE_CELL_WIDTH),
+        "",
+        " ".repeat(SQUARE_CELL_WIDTH),
+        width = SQUARE_CENTER_WIDTH
+    )
+}
+
+fn write_seat_strip<W: Write + QueueableCommand>(
+    out: &mut W,
+    state: &HandState,
+    ctx: SquareCtx<'_>,
+    seats: &[Option<usize>],
+) -> std::io::Result<()> {
+    let cards: Vec<SeatCell> = seats
+        .iter()
+        .map(|&seat| SeatCell {
+            seat,
+            lines: seat
+                .map(|seat| seat_card_lines(state, seat, ctx))
+                .unwrap_or_else(empty_seat_card),
+        })
+        .collect();
+    for line in 0..3 {
+        write!(out, "  ")?;
+        for card in &cards {
+            queue_seat_color(out, state, ctx, card.seat)?;
+            write!(out, "{}", card.lines[line])?;
+            out.queue(ResetColor)?;
+            write!(out, "  ")?;
+        }
+        nl(out)?;
+    }
+    Ok(())
+}
+
+fn write_side_row<W: Write + QueueableCommand>(
+    out: &mut W,
+    state: &HandState,
+    ctx: SquareCtx<'_>,
+    left: Option<usize>,
+    right: Option<usize>,
+    row: usize,
+) -> std::io::Result<()> {
+    let left_cell = SeatCell {
+        seat: left,
+        lines: left
+            .map(|seat| seat_card_lines(state, seat, ctx))
+            .unwrap_or_else(empty_seat_card),
+    };
+    let right_cell = SeatCell {
+        seat: right,
+        lines: right
+            .map(|seat| seat_card_lines(state, seat, ctx))
+            .unwrap_or_else(empty_seat_card),
+    };
+    let center = center_lines(state, row);
+    for (line, center_line) in center.iter().enumerate() {
+        write!(out, "  ")?;
+        queue_seat_color(out, state, ctx, left_cell.seat)?;
+        write!(out, "{}", left_cell.lines[line])?;
+        out.queue(ResetColor)?;
+        write!(out, "  |{center_line}|  ")?;
+        queue_seat_color(out, state, ctx, right_cell.seat)?;
+        write!(out, "{}", right_cell.lines[line])?;
+        out.queue(ResetColor)?;
+        nl(out)?;
+    }
+    Ok(())
+}
+
+fn queue_seat_color<W: Write + QueueableCommand>(
+    out: &mut W,
+    state: &HandState,
+    ctx: SquareCtx<'_>,
+    seat: Option<usize>,
+) -> std::io::Result<()> {
+    if let Some(seat) = seat {
+        let p = &state.players[seat];
+        if ctx.winners.contains(&seat) {
+            out.queue(SetForegroundColor(Color::Green))?;
+        } else if state.to_act == Some(seat) {
+            out.queue(SetForegroundColor(Color::Yellow))?;
+        } else if matches!(p.status, PlayerStatus::Folded | PlayerStatus::SitOut) {
+            out.queue(SetForegroundColor(Color::DarkGrey))?;
+        }
+    }
+    Ok(())
+}
+
+fn fixed_slots<I: Iterator<Item = usize>>(seats: I, cells: usize) -> Vec<Option<usize>> {
+    let mut slots: Vec<Option<usize>> = seats.map(Some).collect();
+    slots.resize(cells, None);
+    slots
+}
+
+fn seat_card_lines(state: &HandState, seat: usize, ctx: SquareCtx<'_>) -> [String; 3] {
+    let p = &state.players[seat];
+    let marker = if state.to_act == Some(seat) { ">" } else { " " };
+    let win = if ctx.winners.contains(&seat) { "*" } else { "" };
+    let tilt = if ctx.tilt_marks.get(seat).copied().unwrap_or(false) {
+        "T"
+    } else {
+        ""
+    };
+    let hole = if let Some(h) = p.hole {
+        if (ctx.hero_seat == Some(seat) || ctx.reveal_all) && p.status != PlayerStatus::Folded {
+            format!("[{}] [{}]", h[0], h[1])
+        } else if p.status == PlayerStatus::Folded {
+            p.last_revealed
+                .map(|c| format!("秀:[{c}]"))
+                .unwrap_or_else(|| "fold".to_string())
+        } else {
+            "[??] [??]".to_string()
+        }
+    } else {
+        String::new()
+    };
+    let pos = position_label(state, seat);
+    let status = compact_status(p);
+    let hud = ctx.hud.and_then(|h| h.get(seat)).map(|s| compact_hud(s));
+    [
+        fit_display(
+            &format!("{marker}{win}#{seat}{pos} {}{}", p.name, tilt),
+            SQUARE_CELL_WIDTH,
+        ),
+        fit_display(&format!("${} {status}", p.stack), SQUARE_CELL_WIDTH),
+        fit_display(
+            &format!("{hole} {}", hud.as_deref().unwrap_or("")),
+            SQUARE_CELL_WIDTH,
+        ),
+    ]
+}
+
+fn center_lines(state: &HandState, row: usize) -> [String; 3] {
+    if row == 0 {
+        [
+            fit_display(&format!("Pot ${}", state.total_pot()), SQUARE_CENTER_WIDTH),
+            fit_display(&board_text(state), SQUARE_CENTER_WIDTH),
+            fit_display(&format!("Bet ${}", state.current_bet), SQUARE_CENTER_WIDTH),
+        ]
+    } else {
+        [
+            fit_display(state.stage.label_zh(), SQUARE_CENTER_WIDTH),
+            fit_display(
+                &format!("MinRaise ${}", state.min_raise),
+                SQUARE_CENTER_WIDTH,
+            ),
+            fit_display("", SQUARE_CENTER_WIDTH),
+        ]
+    }
+}
+
+fn board_text(state: &HandState) -> String {
+    if state.community.is_empty() {
+        "Board: -".to_string()
+    } else {
+        format!(
+            "Board: {}",
+            state
+                .community
+                .iter()
+                .map(|c| format!("[{c}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
+
+fn compact_status(p: &crate::game::state::Player) -> String {
+    match p.status {
+        PlayerStatus::Active => {
+            if p.committed_round > 0 {
+                format!("bet{}", p.committed_round)
+            } else {
+                "-".to_string()
+            }
+        }
+        PlayerStatus::AllIn => "ALLIN".to_string(),
+        PlayerStatus::Folded => "fold".to_string(),
+        PlayerStatus::SitOut => "out".to_string(),
+    }
+}
+
+fn compact_hud(s: &str) -> String {
+    s.replace("VP", "V").replace("PF", "P").replace("AF", "A")
+}
+
+fn fit_display(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    let mut truncated = false;
+    for ch in text.chars() {
+        let w = char_display_width(ch);
+        if used + w > width {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if truncated && width >= 2 {
+        while used + 2 > width {
+            if let Some(ch) = out.pop() {
+                used = used.saturating_sub(char_display_width(ch));
+            } else {
+                break;
+            }
+        }
+        out.push_str("..");
+        used += 2;
+    }
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
+}
+
+fn char_display_width(ch: char) -> usize {
+    if ch.is_ascii() { 1 } else { 2 }
+}
+
+fn empty_seat_card() -> [String; 3] {
+    [
+        " ".repeat(SQUARE_CELL_WIDTH),
+        " ".repeat(SQUARE_CELL_WIDTH),
+        " ".repeat(SQUARE_CELL_WIDTH),
+    ]
 }
 
 /// 返回该座位的位置标签：D / SB / BB / 空。
@@ -218,8 +591,21 @@ pub fn render_showdown(
     log: &[String],
     winners: &[usize],
     tilt_marks: &[bool],
+    hud: Option<&[String]>,
+    layout: Layout,
 ) -> std::io::Result<()> {
-    render(state, None, log, true, winners, tilt_marks)
+    render(
+        state,
+        RenderOptions {
+            hero_seat: None,
+            log,
+            reveal_all: true,
+            winners,
+            tilt_marks,
+            hud,
+            layout,
+        },
+    )
 }
 
 /// `wait_for_continue` 的用户选择。

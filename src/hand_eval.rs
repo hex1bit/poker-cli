@@ -1,7 +1,8 @@
 //! 5/7 张牌的牌型评估。
 //!
 //! `HandRank` 自带充足踢脚信息，直接 `Ord` 比较即可决定胜负。
-//! 7 张评估通过枚举 C(7,5)=21 种组合并取最大实现。
+//! 7 张评估走"直接位图 + 计数"快速路径，无堆分配；
+//! `evaluate_7_with_best` 仍走 21-组合枚举（仅用于摊牌展示）。
 
 use crate::card::{Card, Rank};
 
@@ -21,16 +22,6 @@ pub enum Category {
 }
 
 /// 完整牌力描述：(category, 五个比较键)。
-///
-/// 用统一的 5 元素 tiebreaker 数组：
-/// - HighCard: 5 张降序 rank
-/// - Pair: [pair_rank, k1, k2, k3, 0]
-/// - TwoPair: [hi_pair, lo_pair, kicker, 0, 0]
-/// - ThreeKind: [trips, k1, k2, 0, 0]
-/// - Straight / StraightFlush: [top_card, 0, 0, 0, 0]
-/// - Flush: 5 张降序 rank
-/// - FullHouse: [trips, pair, 0, 0, 0]
-/// - FourKind: [quads, kicker, 0, 0, 0]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HandRank {
     pub category: Category,
@@ -43,117 +34,271 @@ impl HandRank {
     }
 }
 
-/// 评估恰好 5 张牌，返回 HandRank。
+/// 评估恰好 5 张牌，返回 HandRank。无堆分配。
 pub fn evaluate_5(cards: &[Card; 5]) -> HandRank {
-    // rank 计数（0..13），suit 计数（0..4）
     let mut rank_cnt = [0u8; 13];
     let mut suit_cnt = [0u8; 4];
-    let mut ranks_sorted: [u8; 5] = [0; 5];
-    for (i, c) in cards.iter().enumerate() {
-        rank_cnt[c.rank().as_u8() as usize] += 1;
-        suit_cnt[c.suit().as_u8() as usize] += 1;
-        ranks_sorted[i] = c.rank().as_u8();
+    let mut rank_bits: u16 = 0;
+    for c in cards {
+        let r = c.rank().as_u8();
+        let s = c.suit().as_u8();
+        rank_cnt[r as usize] += 1;
+        suit_cnt[s as usize] += 1;
+        rank_bits |= 1u16 << r;
     }
-    ranks_sorted.sort_unstable_by(|a, b| b.cmp(a)); // 降序
+    let is_flush = suit_cnt.iter().any(|&c| c == 5);
+    let straight_top = detect_straight_bits(rank_bits);
 
-    let is_flush = suit_cnt.iter().any(|&n| n == 5);
-
-    // 检测顺子：返回顺子最高牌（Ace-low straight 即 A2345 返回 5=Rank::Five.as_u8()=3）
-    let straight_top: Option<u8> = detect_straight(&rank_cnt);
-
-    if is_flush && straight_top.is_some() {
-        return HandRank::new(Category::StraightFlush, [straight_top.unwrap(), 0, 0, 0, 0]);
+    if is_flush && let Some(top) = straight_top {
+        return HandRank::new(Category::StraightFlush, [top, 0, 0, 0, 0]);
     }
 
-    // 收集 (count, rank) 对，先按 count 降序，再按 rank 降序
-    let mut groups: Vec<(u8, u8)> = (0..13u8)
-        .filter(|&r| rank_cnt[r as usize] > 0)
-        .map(|r| (rank_cnt[r as usize], r))
-        .collect();
-    groups.sort_unstable_by(|a, b| b.cmp(a));
-
-    match groups[0].0 {
-        4 => {
-            // 四条
-            let quads = groups[0].1;
-            let kicker = groups[1].1;
-            HandRank::new(Category::FourKind, [quads, kicker, 0, 0, 0])
-        }
-        3 if groups.len() > 1 && groups[1].0 >= 2 => {
-            // 葫芦
-            HandRank::new(Category::FullHouse, [groups[0].1, groups[1].1, 0, 0, 0])
-        }
-        _ if is_flush => {
-            let mut t = [0u8; 5];
-            t.copy_from_slice(&ranks_sorted);
-            HandRank::new(Category::Flush, t)
-        }
-        _ if straight_top.is_some() => {
-            HandRank::new(Category::Straight, [straight_top.unwrap(), 0, 0, 0, 0])
-        }
-        3 => {
-            // 三条
-            let trips = groups[0].1;
-            let k1 = groups[1].1;
-            let k2 = if groups.len() > 2 { groups[2].1 } else { 0 };
-            HandRank::new(Category::ThreeKind, [trips, k1, k2, 0, 0])
-        }
-        2 if groups.len() > 1 && groups[1].0 == 2 => {
-            // 两对
-            let hi = groups[0].1.max(groups[1].1);
-            let lo = groups[0].1.min(groups[1].1);
-            let kicker = groups[2].1;
-            HandRank::new(Category::TwoPair, [hi, lo, kicker, 0, 0])
-        }
-        2 => {
-            // 一对
-            let pair = groups[0].1;
-            let k1 = groups[1].1;
-            let k2 = groups[2].1;
-            let k3 = groups[3].1;
-            HandRank::new(Category::Pair, [pair, k1, k2, k3, 0])
-        }
-        _ => {
-            // 高牌
-            let mut t = [0u8; 5];
-            t.copy_from_slice(&ranks_sorted);
-            HandRank::new(Category::HighCard, t)
+    let mut quad: Option<u8> = None;
+    let mut trips: Option<u8> = None;
+    let mut pairs: [u8; 2] = [0; 2];
+    let mut pairs_n: usize = 0;
+    for r in (0..13u8).rev() {
+        match rank_cnt[r as usize] {
+            4 => quad = Some(r),
+            3 => trips = Some(r),
+            2 => {
+                if pairs_n < 2 {
+                    pairs[pairs_n] = r;
+                    pairs_n += 1;
+                }
+            }
+            _ => {}
         }
     }
+
+    if let Some(q) = quad {
+        let kicker = highest_rank_excluding(&rank_cnt, &[q]);
+        return HandRank::new(Category::FourKind, [q, kicker, 0, 0, 0]);
+    }
+    if let Some(t) = trips
+        && pairs_n >= 1
+    {
+        return HandRank::new(Category::FullHouse, [t, pairs[0], 0, 0, 0]);
+    }
+    if is_flush {
+        let mut tb = [0u8; 5];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if rank_bits & (1u16 << r) != 0 {
+                tb[idx] = r;
+                idx += 1;
+                if idx == 5 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::Flush, tb);
+    }
+    if let Some(top) = straight_top {
+        return HandRank::new(Category::Straight, [top, 0, 0, 0, 0]);
+    }
+    if let Some(t) = trips {
+        let mut k = [0u8; 2];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if r != t && rank_cnt[r as usize] > 0 {
+                k[idx] = r;
+                idx += 1;
+                if idx == 2 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::ThreeKind, [t, k[0], k[1], 0, 0]);
+    }
+    if pairs_n == 2 {
+        let kicker = highest_rank_excluding(&rank_cnt, &[pairs[0], pairs[1]]);
+        return HandRank::new(Category::TwoPair, [pairs[0], pairs[1], kicker, 0, 0]);
+    }
+    if pairs_n == 1 {
+        let p = pairs[0];
+        let mut k = [0u8; 3];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if r != p && rank_cnt[r as usize] > 0 {
+                k[idx] = r;
+                idx += 1;
+                if idx == 3 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::Pair, [p, k[0], k[1], k[2], 0]);
+    }
+    // 高牌
+    let mut tb = [0u8; 5];
+    let mut idx = 0;
+    for r in (0..13u8).rev() {
+        if rank_cnt[r as usize] > 0 {
+            tb[idx] = r;
+            idx += 1;
+            if idx == 5 {
+                break;
+            }
+        }
+    }
+    HandRank::new(Category::HighCard, tb)
 }
 
-/// 返回顺子的最高牌 rank（0..12）。考虑 A-2-3-4-5 (轮子)，最高牌为 5 (Rank::Five=3)。
-fn detect_straight(rank_cnt: &[u8; 13]) -> Option<u8> {
-    // bitmap: bit i set ⇔ rank i 至少出现一次
-    let mut bits: u16 = 0;
-    for i in 0..13 {
-        if rank_cnt[i] > 0 {
-            bits |= 1 << i;
-        }
-    }
-    // Ace 作 -1 处理：检查 A2345（bits 含 Two..Five 与 Ace）
-    let ace_bit = 1u16 << (Rank::Ace.as_u8());
-    let low_straight = (1u16 << Rank::Two.as_u8())
-        | (1u16 << Rank::Three.as_u8())
-        | (1u16 << Rank::Four.as_u8())
-        | (1u16 << Rank::Five.as_u8());
-    if (bits & ace_bit) != 0 && (bits & low_straight) == low_straight {
-        return Some(Rank::Five.as_u8());
-    }
-    // 一般顺子：从高到低找连续 5 个 bit。
-    for top in (4..=12i32).rev() {
-        let mask = 0b11111u16 << (top - 4);
-        if (bits & mask) == mask {
-            return Some(top as u8);
-        }
-    }
-    None
-}
-
-/// 评估 7 张中最优 5 张组合。
+/// 评估 7 张牌，返回最佳 5 张组成的 HandRank。无堆分配，无 21-组合枚举。
 pub fn evaluate_7(cards: &[Card; 7]) -> HandRank {
+    let mut rank_cnt = [0u8; 13];
+    let mut suit_cnt = [0u8; 4];
+    let mut suit_bits = [0u16; 4];
+    let mut rank_bits: u16 = 0;
+    for c in cards {
+        let r = c.rank().as_u8();
+        let s = c.suit().as_u8();
+        rank_cnt[r as usize] += 1;
+        suit_cnt[s as usize] += 1;
+        suit_bits[s as usize] |= 1u16 << r;
+        rank_bits |= 1u16 << r;
+    }
+
+    // 同花花色（最多一种 ≥5）
+    let flush_suit = (0..4usize).find(|&s| suit_cnt[s] >= 5);
+
+    // 同花顺
+    if let Some(s) = flush_suit
+        && let Some(top) = detect_straight_bits(suit_bits[s])
+    {
+        return HandRank::new(Category::StraightFlush, [top, 0, 0, 0, 0]);
+    }
+
+    // 收集 count groups（按 rank 降序）
+    let mut quad: Option<u8> = None;
+    let mut trips: [u8; 2] = [0; 2];
+    let mut trips_n: usize = 0;
+    let mut pairs: [u8; 3] = [0; 3];
+    let mut pairs_n: usize = 0;
+    for r in (0..13u8).rev() {
+        match rank_cnt[r as usize] {
+            4 => {
+                if quad.is_none() {
+                    quad = Some(r);
+                }
+            }
+            3 => {
+                if trips_n < 2 {
+                    trips[trips_n] = r;
+                    trips_n += 1;
+                }
+            }
+            2 => {
+                if pairs_n < 3 {
+                    pairs[pairs_n] = r;
+                    pairs_n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 四条
+    if let Some(q) = quad {
+        let kicker = highest_rank_excluding(&rank_cnt, &[q]);
+        return HandRank::new(Category::FourKind, [q, kicker, 0, 0, 0]);
+    }
+
+    // 葫芦：三条 + 对子，或 两个三条（取低三条作对）
+    if trips_n >= 1 {
+        let t = trips[0];
+        if pairs_n >= 1 {
+            return HandRank::new(Category::FullHouse, [t, pairs[0], 0, 0, 0]);
+        }
+        if trips_n >= 2 {
+            return HandRank::new(Category::FullHouse, [t, trips[1], 0, 0, 0]);
+        }
+    }
+
+    // 同花
+    if let Some(s) = flush_suit {
+        let bits = suit_bits[s];
+        let mut tb = [0u8; 5];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if bits & (1u16 << r) != 0 {
+                tb[idx] = r;
+                idx += 1;
+                if idx == 5 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::Flush, tb);
+    }
+
+    // 顺子
+    if let Some(top) = detect_straight_bits(rank_bits) {
+        return HandRank::new(Category::Straight, [top, 0, 0, 0, 0]);
+    }
+
+    // 三条
+    if trips_n >= 1 {
+        let t = trips[0];
+        let mut k = [0u8; 2];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if r != t && rank_cnt[r as usize] > 0 {
+                k[idx] = r;
+                idx += 1;
+                if idx == 2 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::ThreeKind, [t, k[0], k[1], 0, 0]);
+    }
+
+    // 两对
+    if pairs_n >= 2 {
+        let hi = pairs[0];
+        let lo = pairs[1];
+        let kicker = highest_rank_excluding(&rank_cnt, &[hi, lo]);
+        return HandRank::new(Category::TwoPair, [hi, lo, kicker, 0, 0]);
+    }
+
+    // 一对
+    if pairs_n == 1 {
+        let p = pairs[0];
+        let mut k = [0u8; 3];
+        let mut idx = 0;
+        for r in (0..13u8).rev() {
+            if r != p && rank_cnt[r as usize] > 0 {
+                k[idx] = r;
+                idx += 1;
+                if idx == 3 {
+                    break;
+                }
+            }
+        }
+        return HandRank::new(Category::Pair, [p, k[0], k[1], k[2], 0]);
+    }
+
+    // 高牌
+    let mut tb = [0u8; 5];
+    let mut idx = 0;
+    for r in (0..13u8).rev() {
+        if rank_cnt[r as usize] > 0 {
+            tb[idx] = r;
+            idx += 1;
+            if idx == 5 {
+                break;
+            }
+        }
+    }
+    HandRank::new(Category::HighCard, tb)
+}
+
+/// 评估 7 张中最优 5 张组合，并返回该组合（用于摊牌展示，非热路径）。
+pub fn evaluate_7_with_best(cards: &[Card; 7]) -> (HandRank, [Card; 5]) {
     let mut best: Option<HandRank> = None;
-    // C(7,5)=21 个组合
+    let mut best_cards: Option<[Card; 5]> = None;
     for a in 0..3 {
         for b in (a + 1)..4 {
             for c in (b + 1)..5 {
@@ -162,8 +307,14 @@ pub fn evaluate_7(cards: &[Card; 7]) -> HandRank {
                         let five = [cards[a], cards[b], cards[c], cards[d], cards[e]];
                         let r = evaluate_5(&five);
                         match best {
-                            None => best = Some(r),
-                            Some(cur) if r > cur => best = Some(r),
+                            None => {
+                                best = Some(r);
+                                best_cards = Some(five);
+                            }
+                            Some(cur) if r > cur => {
+                                best = Some(r);
+                                best_cards = Some(five);
+                            }
                             _ => {}
                         }
                     }
@@ -171,7 +322,123 @@ pub fn evaluate_7(cards: &[Card; 7]) -> HandRank {
             }
         }
     }
-    best.expect("21 combos enumerated")
+    (
+        best.expect("21 combos enumerated"),
+        best_cards.expect("21 combos enumerated"),
+    )
+}
+
+/// 给出顺子最高牌的 rank 索引（0..12）。识别 A-2-3-4-5（轮子）。
+fn detect_straight_bits(bits: u16) -> Option<u8> {
+    // 从高到低扫 5 连
+    for top in (4..=12u8).rev() {
+        let mask = 0b11111u16 << (top - 4);
+        if (bits & mask) == mask {
+            return Some(top);
+        }
+    }
+    // 轮子 A2345
+    let wheel = (1u16 << Rank::Ace.as_u8())
+        | (1u16 << Rank::Two.as_u8())
+        | (1u16 << Rank::Three.as_u8())
+        | (1u16 << Rank::Four.as_u8())
+        | (1u16 << Rank::Five.as_u8());
+    if (bits & wheel) == wheel {
+        return Some(Rank::Five.as_u8());
+    }
+    None
+}
+
+fn highest_rank_excluding(rank_cnt: &[u8; 13], excl: &[u8]) -> u8 {
+    for r in (0..13u8).rev() {
+        if rank_cnt[r as usize] > 0 && !excl.contains(&r) {
+            return r;
+        }
+    }
+    0
+}
+
+/// 返回适合日志展示的牌型描述。
+pub fn describe_rank(rank: HandRank) -> String {
+    let r = |v: u8| {
+        Rank::from_u8(v)
+            .expect("rank tiebreak should be valid")
+            .label()
+    };
+    match rank.category {
+        Category::HighCard => format!("高牌 {}", r(rank.tiebreak[0])),
+        Category::Pair => format!("一对 {}", r(rank.tiebreak[0])),
+        Category::TwoPair => format!("两对 {} 和 {}", r(rank.tiebreak[0]), r(rank.tiebreak[1])),
+        Category::ThreeKind => format!("三条 {}", r(rank.tiebreak[0])),
+        Category::Straight => format!("顺子，到 {}", r(rank.tiebreak[0])),
+        Category::Flush => format!("同花，{} 高", r(rank.tiebreak[0])),
+        Category::FullHouse => format!("葫芦，{} 带 {}", r(rank.tiebreak[0]), r(rank.tiebreak[1])),
+        Category::FourKind => format!("四条 {}", r(rank.tiebreak[0])),
+        Category::StraightFlush => format!("同花顺，到 {}", r(rank.tiebreak[0])),
+    }
+}
+
+/// 评估 7 张牌并返回日志展示文本。
+pub fn describe_7(cards: &[Card; 7]) -> String {
+    describe_rank(evaluate_7(cards))
+}
+
+/// 给真人玩家做的"当前最佳牌型"预览：根据已发的公共牌数量自动选择评估方式。
+/// `community.len()` 必须 ∈ {3, 4, 5}，否则返回 None。
+pub fn describe_hero(hole: [Card; 2], community: &[Card]) -> Option<String> {
+    match community.len() {
+        3 => {
+            let five = [hole[0], hole[1], community[0], community[1], community[2]];
+            Some(describe_rank(evaluate_5(&five)))
+        }
+        4 => {
+            let six = [
+                hole[0],
+                hole[1],
+                community[0],
+                community[1],
+                community[2],
+                community[3],
+            ];
+            // C(6,5) = 6 组合：每次跳过一张
+            let mut best: Option<HandRank> = None;
+            for skip in 0..6 {
+                let mut five = [six[0]; 5];
+                let mut idx = 0;
+                for (i, card) in six.iter().enumerate() {
+                    if i != skip {
+                        five[idx] = *card;
+                        idx += 1;
+                    }
+                }
+                let r = evaluate_5(&five);
+                best = Some(match best {
+                    Some(cur) if cur >= r => cur,
+                    _ => r,
+                });
+            }
+            best.map(describe_rank)
+        }
+        5 => {
+            let seven = [
+                hole[0],
+                hole[1],
+                community[0],
+                community[1],
+                community[2],
+                community[3],
+                community[4],
+            ];
+            Some(describe_7(&seven))
+        }
+        _ => None,
+    }
+}
+
+/// 评估 7 张牌，返回牌型描述和实际采用的最佳 5 张牌。
+pub fn describe_7_with_best(cards: &[Card; 7]) -> (String, [Card; 5]) {
+    let (rank, best) = evaluate_7_with_best(cards);
+    (describe_rank(rank), best)
 }
 
 #[cfg(test)]
@@ -199,7 +466,6 @@ mod tests {
 
     #[test]
     fn detects_wheel_straight() {
-        // A-2-3-4-5
         let hand = [
             c(Rank::Ace, Suit::Hearts),
             c(Rank::Two, Suit::Diamonds),
@@ -274,7 +540,6 @@ mod tests {
         ];
         let rh = evaluate_5(&hi);
         let rl = evaluate_5(&lo);
-        // KKxx 22 5 > QQ JJ 5? K=11, Q=10 → hi > lo
         assert!(rh > rl);
     }
 
@@ -294,7 +559,6 @@ mod tests {
             c(Rank::Jack, Suit::Spades),
             c(Rank::Ten, Suit::Hearts),
         ];
-        // Both AA. A's kicker K > Q ⇒ a wins.
         assert!(evaluate_5(&a) > evaluate_5(&b));
     }
 
@@ -331,7 +595,6 @@ mod tests {
 
     #[test]
     fn evaluate_7_picks_best() {
-        // 7 张里包含一个 royal flush + 一个 noise pair, 应识别 royal flush
         let hand = [
             c(Rank::Ten, Suit::Hearts),
             c(Rank::Jack, Suit::Hearts),
@@ -348,7 +611,6 @@ mod tests {
 
     #[test]
     fn evaluate_7_two_pair_vs_set() {
-        // hole: AA, board: A 5 5 9 K  -> full house A's full of 5s
         let hand = [
             c(Rank::Ace, Suit::Hearts),
             c(Rank::Ace, Suit::Diamonds),
@@ -360,5 +622,44 @@ mod tests {
         ];
         let r = evaluate_7(&hand);
         assert_eq!(r.category, Category::FullHouse);
+    }
+
+    /// 与 21-组合枚举 (慢路径) 在大量随机 7 张牌组合上保持一致。
+    #[test]
+    fn evaluate_7_matches_brute_force() {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0DEFEED);
+        let deck: Vec<Card> = (0..52u8).map(|i| Card::from_index(i).unwrap()).collect();
+        for _ in 0..2000 {
+            let mut d = deck.clone();
+            d.shuffle(&mut rng);
+            let cards: [Card; 7] = [d[0], d[1], d[2], d[3], d[4], d[5], d[6]];
+            let fast = evaluate_7(&cards);
+            let slow = evaluate_7_with_best(&cards).0;
+            assert_eq!(
+                fast, slow,
+                "fast vs brute-force diverged on {:?}\n fast={:?}\n slow={:?}",
+                cards, fast, slow
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_7_two_trips_full_house() {
+        // 两组 trips：AAA + KKK + 散
+        let hand = [
+            c(Rank::Ace, Suit::Hearts),
+            c(Rank::Ace, Suit::Diamonds),
+            c(Rank::Ace, Suit::Clubs),
+            c(Rank::King, Suit::Spades),
+            c(Rank::King, Suit::Hearts),
+            c(Rank::King, Suit::Diamonds),
+            c(Rank::Two, Suit::Clubs),
+        ];
+        let r = evaluate_7(&hand);
+        assert_eq!(r.category, Category::FullHouse);
+        assert_eq!(r.tiebreak[0], Rank::Ace.as_u8());
+        assert_eq!(r.tiebreak[1], Rank::King.as_u8());
     }
 }

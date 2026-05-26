@@ -1,4 +1,4 @@
-//! Bot 性格档案与预置 6 种风格。
+//! Bot 性格档案与预置风格。
 //!
 //! 每个性格通过若干 0..1 / 0..∞ 的参数描述其打法倾向；
 //! `decision.rs` 会把这些参数与当前手牌强度、底池赔率、位置等组合成具体决策。
@@ -107,14 +107,112 @@ impl Personality {
         label: "Bluffer",
     };
 
-    /// 预置 6 种顺序列表，按用户偏好顺序展示。
-    pub const PRESETS: [Personality; 6] = [
+    pub const NIT: Personality = Personality {
+        vpip: 0.10,
+        pfr: 0.06,
+        aggression: 1.1,
+        bluff_freq: 0.01,
+        slowplay_freq: 0.03,
+        cbet_freq: 0.45,
+        tilt_factor: 0.05,
+        position_aware: 0.70,
+        show_freq: 0.01,
+        label: "Nit",
+    };
+
+    pub const CALLING_STATION: Personality = Personality {
+        vpip: 0.62,
+        pfr: 0.04,
+        aggression: 0.35,
+        bluff_freq: 0.02,
+        slowplay_freq: 0.08,
+        cbet_freq: 0.18,
+        tilt_factor: 0.25,
+        position_aware: 0.05,
+        show_freq: 0.12,
+        label: "Station",
+    };
+
+    pub const PRO: Personality = Personality {
+        vpip: 0.26,
+        pfr: 0.21,
+        aggression: 2.8,
+        bluff_freq: 0.18,
+        slowplay_freq: 0.12,
+        cbet_freq: 0.72,
+        tilt_factor: 0.04,
+        position_aware: 0.95,
+        show_freq: 0.03,
+        label: "Pro",
+    };
+
+    pub const GAMBLER: Personality = Personality {
+        vpip: 0.48,
+        pfr: 0.22,
+        aggression: 2.2,
+        bluff_freq: 0.22,
+        slowplay_freq: 0.08,
+        cbet_freq: 0.62,
+        tilt_factor: 0.45,
+        position_aware: 0.20,
+        show_freq: 0.18,
+        label: "Gambler",
+    };
+
+    pub const WEAK_TIGHT: Personality = Personality {
+        vpip: 0.18,
+        pfr: 0.07,
+        aggression: 0.45,
+        bluff_freq: 0.01,
+        slowplay_freq: 0.08,
+        cbet_freq: 0.30,
+        tilt_factor: 0.18,
+        position_aware: 0.45,
+        show_freq: 0.04,
+        label: "WeakTight",
+    };
+
+    pub const BALANCED_REG: Personality = Personality {
+        vpip: 0.24,
+        pfr: 0.19,
+        aggression: 2.1,
+        bluff_freq: 0.14,
+        slowplay_freq: 0.12,
+        cbet_freq: 0.66,
+        tilt_factor: 0.08,
+        position_aware: 0.85,
+        show_freq: 0.04,
+        label: "BalancedReg",
+    };
+
+    pub const SHORT_STACKER: Personality = Personality {
+        vpip: 0.19,
+        pfr: 0.17,
+        aggression: 3.4,
+        bluff_freq: 0.10,
+        slowplay_freq: 0.04,
+        cbet_freq: 0.60,
+        tilt_factor: 0.12,
+        position_aware: 0.75,
+        show_freq: 0.03,
+        label: "ShortStacker",
+    };
+
+    /// 预置 13 种顺序列表，按用户偏好顺序展示。
+    pub const PRESETS: [Personality; 13] = [
         Personality::ROCK,
         Personality::SHARK,
         Personality::MANIAC,
         Personality::FISH,
         Personality::TRAPPER,
         Personality::BLUFFER,
+        Personality::NIT,
+        Personality::CALLING_STATION,
+        Personality::PRO,
+        Personality::GAMBLER,
+        Personality::WEAK_TIGHT,
+        Personality::BALANCED_REG,
+        Personality::SHORT_STACKER,
     ];
 
     /// 按名字查找（大小写不敏感）。

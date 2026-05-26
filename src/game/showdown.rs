@@ -112,9 +112,9 @@ pub fn settle(state: &mut HandState) -> Vec<i64> {
 
     // 4) 写回 stack 并计算 delta。
     let mut delta = Vec::with_capacity(n);
-    for i in 0..n {
-        state.players[i].stack += received[i];
-        let d = received[i] as i64 - state.players[i].committed_total as i64;
+    for (i, &amount) in received.iter().enumerate() {
+        state.players[i].stack += amount;
+        let d = amount as i64 - state.players[i].committed_total as i64;
         delta.push(d);
     }
     delta
@@ -133,7 +133,7 @@ fn split_evenly(received: &mut [u64], pot_size: u64, winners: &[usize], button: 
     }
     // 按按钮位之后的顺序依次发放 1 chip
     let n = received.len();
-    let mut order: Vec<usize> = winners.iter().copied().collect();
+    let mut order: Vec<usize> = winners.to_vec();
     order.sort_by_key(|&i| ((i + n - button) % n) as i64);
     for &w in &order {
         if rem == 0 {
@@ -154,7 +154,10 @@ mod tests {
         Card::new(r, s)
     }
 
-    fn mk_state(commits_and_holes: Vec<(u64, Option<[Card; 2]>, PlayerStatus)>, board: Vec<Card>) -> HandState {
+    fn mk_state(
+        commits_and_holes: Vec<(u64, Option<[Card; 2]>, PlayerStatus)>,
+        board: Vec<Card>,
+    ) -> HandState {
         let mut players = Vec::new();
         for (i, (commit, hole, status)) in commits_and_holes.into_iter().enumerate() {
             let mut p = Player::new(format!("P{i}"), 0);

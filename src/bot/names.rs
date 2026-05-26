@@ -17,21 +17,25 @@ pub fn name_pool(persona: &Personality) -> &'static [&'static str] {
         "Fish" => &["小白", "凯子", "阿弟", "海底捞", "活宝"],
         "Trapper" => &["老猫", "钓王", "黑寡妇", "深水", "藏锋"],
         "Bluffer" => &["影帝", "大忽悠", "美猴王", "戏精", "嘴炮王"],
+        "Nit" => &["铁闸", "保险柜", "老锁", "风控官", "只打AA"],
+        "Station" => &["跟到底", "呼叫台", "不信邪", "河边等", "粘人精"],
+        "Pro" => &["牌桌经理", "冷读者", "算子", "终局者", "职业哥"],
+        "Gambler" => &["赌徒", "硬币哥", "手气王", "搏命仔", "翻倍侠"],
+        "WeakTight" => &["怕输哥", "小心眼", "安全带", "缩手王", "保本派"],
+        "BalancedReg" => &["常规哥", "平衡师", "牌局工兵", "稳准狠", "标准答案"],
+        "ShortStacker" => &["短码侠", "推土机", "浅筹码", "翻倍党", "十盲王"],
         _ => &["路人甲"],
     }
 }
 
 /// 为一桌 bots 采样不重复的绰号。返回长度等于 personas.len() 的 Vec。
-pub fn sample_table_names<R: Rng + ?Sized>(
-    personas: &[Personality],
-    rng: &mut R,
-) -> Vec<String> {
+pub fn sample_table_names<R: Rng + ?Sized>(personas: &[Personality], rng: &mut R) -> Vec<String> {
     let mut used: Vec<String> = Vec::with_capacity(personas.len());
     let mut out: Vec<String> = Vec::with_capacity(personas.len());
 
     for p in personas {
         let pool = name_pool(p);
-        let mut shuffled: Vec<&'static str> = pool.iter().copied().collect();
+        let mut shuffled: Vec<&'static str> = pool.to_vec();
         shuffled.shuffle(rng);
 
         let mut picked: Option<String> = None;
@@ -67,11 +71,16 @@ mod tests {
     fn table_names_unique() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let names = sample_table_names(&Personality::PRESETS, &mut rng);
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), Personality::PRESETS.len());
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), 6, "names not unique: {:?}", names);
+        assert_eq!(
+            sorted.len(),
+            Personality::PRESETS.len(),
+            "names not unique: {:?}",
+            names
+        );
     }
 
     #[test]

@@ -46,9 +46,10 @@ pub fn start_hand<R: Rng + ?Sized>(
         p.last_revealed = None;
     }
 
-    // 发底牌（两轮发，符合真实习惯，但牌等价）。
-    let mut active_seats: Vec<usize> =
-        (0..n).filter(|&i| state.players[i].status == PlayerStatus::Active).collect();
+    // 发底牌（两轮发，符合真实习惯）。
+    let mut active_seats: Vec<usize> = (0..n)
+        .filter(|&i| state.players[i].status == PlayerStatus::Active)
+        .collect();
     // 发牌顺序：从按钮位左手第一个开始
     rotate_to_first_after(&mut active_seats, button);
     for _ in 0..2 {
@@ -56,20 +57,10 @@ pub fn start_hand<R: Rng + ?Sized>(
             let c = state.deck.pop().expect("deck has cards");
             let p = &mut state.players[seat];
             p.hole = match p.hole {
-                None => Some([c, c]), // 占位，下一步覆盖
+                None => Some([c, c]),
                 Some([a, _]) => Some([a, c]),
             };
-            // 第一次写入时把第二槽位填上后续会覆盖；为避免不一致，做正确处理：
         }
-    }
-    // 上面的赋值有 bug——重写正确版本：
-    for p in &mut state.players {
-        p.hole = None;
-    }
-    for &seat in &active_seats {
-        let c1 = state.deck.pop().unwrap();
-        let c2 = state.deck.pop().unwrap();
-        state.players[seat].hole = Some([c1, c2]);
     }
 
     // 贴盲：SB / BB 位置。
@@ -115,7 +106,7 @@ fn post_blind(state: &mut HandState, seat: usize, amount: u64) {
     }
 }
 
-fn rotate_to_first_after(seats: &mut Vec<usize>, button: usize) {
+fn rotate_to_first_after(seats: &mut [usize], button: usize) {
     seats.sort_unstable();
     // 找到第一个 > button 的下标位置
     let pos = seats.iter().position(|&i| i > button).unwrap_or(0);
@@ -279,7 +270,9 @@ fn advance_to_act(state: &mut HandState) {
     let all_matched = active_to_act
         .iter()
         .all(|&i| state.players[i].committed_round == state.current_bet);
-    let all_acted = active_to_act.iter().all(|&i| state.players[i].acted_this_round);
+    let all_acted = active_to_act
+        .iter()
+        .all(|&i| state.players[i].acted_this_round);
 
     if active_to_act.is_empty() || (all_matched && all_acted) {
         state.to_act = None;
@@ -346,9 +339,7 @@ pub fn advance_street(state: &mut HandState) {
     state.last_aggressor = None;
 
     // 若只剩 ≤1 人可行动（其他全 all-in），无需再下注，直接快进到 showdown。
-    if state.players.iter().filter(|p| p.can_act()).count() <= 1
-        && state.in_hand_count() > 1
-    {
+    if state.players.iter().filter(|p| p.can_act()).count() <= 1 && state.in_hand_count() > 1 {
         // 还需要发完剩余的公共牌
         while state.community.len() < 5 {
             match state.stage {
@@ -392,6 +383,7 @@ fn deal_river(state: &mut HandState) {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+    use std::collections::HashSet;
 
     fn fresh(players: usize) -> HandState {
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
@@ -399,6 +391,53 @@ mod tests {
             .map(|i| Player::new(format!("P{i}"), 1000))
             .collect();
         start_hand(plist, 0, 5, 10, &mut rng)
+    }
+
+    fn seen_cards(state: &HandState) -> Vec<u8> {
+        let mut cards = Vec::new();
+        for p in &state.players {
+            if let Some(h) = p.hole {
+                cards.push(h[0].index());
+                cards.push(h[1].index());
+            }
+        }
+        cards.extend(state.community.iter().map(|c| c.index()));
+        cards.extend(state.deck.iter().map(|c| c.index()));
+        cards
+    }
+
+    #[test]
+    fn start_hand_deals_exactly_two_cards_per_active_player() {
+        let s = fresh(6);
+        assert_eq!(s.deck.len(), 52 - 6 * 2);
+        for p in &s.players {
+            assert!(p.hole.is_some());
+        }
+    }
+
+    #[test]
+    fn dealt_cards_and_deck_remain_unique() {
+        let mut s = fresh(6);
+        let cards = seen_cards(&s);
+        let unique: HashSet<_> = cards.iter().copied().collect();
+        assert_eq!(cards.len(), 52);
+        assert_eq!(unique.len(), 52);
+
+        while let Some(seat) = s.to_act {
+            let action = if s.to_call_for(seat) == 0 {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            apply_action(&mut s, seat, action).unwrap();
+        }
+        advance_street(&mut s);
+        assert_eq!(s.community.len(), 3);
+        let cards = seen_cards(&s);
+        let unique: HashSet<_> = cards.iter().copied().collect();
+        assert_eq!(cards.len(), 51);
+        assert_eq!(unique.len(), 51);
+        assert_eq!(s.deck.len(), 52 - 12 - 1 - 3);
     }
 
     #[test]
@@ -419,6 +458,23 @@ mod tests {
         assert_eq!(s.players[0].committed_round, 5);
         assert_eq!(s.players[1].committed_round, 10);
         assert_eq!(s.to_act, Some(0));
+    }
+
+    #[test]
+    fn ten_handed_preflop_reaches_button_player() {
+        let mut s = fresh(10);
+        let mut order = Vec::new();
+        while let Some(seat) = s.to_act {
+            order.push(seat);
+            let action = if s.to_call_for(seat) == 0 {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            apply_action(&mut s, seat, action).unwrap();
+        }
+        assert_eq!(order, vec![3, 4, 5, 6, 7, 8, 9, 0, 1, 2]);
+        assert!(round_closed(&s));
     }
 
     #[test]

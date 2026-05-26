@@ -15,6 +15,8 @@ pub struct Frame {
 #[derive(Debug, Clone)]
 pub struct HandHistory {
     pub frames: Vec<Frame>,
+    /// 本手牌的日志快照（相对本手开局）。
+    pub logs: Vec<String>,
     /// 摊牌或单人胜出时的最终 log 总长度。
     pub final_log_len: usize,
     /// 最终赢家座位。
@@ -25,6 +27,7 @@ impl HandHistory {
     pub fn new() -> Self {
         Self {
             frames: Vec::new(),
+            logs: Vec::new(),
             final_log_len: 0,
             winners: Vec::new(),
         }
@@ -35,6 +38,14 @@ impl HandHistory {
             state: state.clone(),
             log_len,
         });
+    }
+
+    pub fn set_logs(&mut self, logs: &[String], start_log_len: usize) {
+        self.logs = logs[start_log_len..].to_vec();
+        for frame in &mut self.frames {
+            frame.log_len = frame.log_len.saturating_sub(start_log_len);
+        }
+        self.final_log_len = self.final_log_len.saturating_sub(start_log_len);
     }
 }
 
@@ -47,15 +58,19 @@ impl Default for HandHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::action::Action;
     use crate::game::betting::{advance_street, apply_action, round_closed, start_hand};
     use crate::game::state::Player;
-    use crate::game::action::Action;
     use rand::SeedableRng;
 
     #[test]
     fn frames_grow_during_a_hand() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
-        let players = vec![Player::new("A", 1000), Player::new("B", 1000), Player::new("C", 1000)];
+        let players = vec![
+            Player::new("A", 1000),
+            Player::new("B", 1000),
+            Player::new("C", 1000),
+        ];
         let mut s = start_hand(players, 0, 5, 10, &mut rng);
         let mut h = HandHistory::new();
         h.push(&s, 0);

@@ -6,4 +6,5 @@ pub mod config;
 pub mod equity;
 pub mod game;
 pub mod hand_eval;
+pub mod table;
 pub mod ui;
