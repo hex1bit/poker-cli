@@ -58,7 +58,7 @@ impl Personality {
     pub const MANIAC: Personality = Personality {
         vpip: 0.42,
         pfr: 0.35,
-        aggression: 4.0,
+        aggression: 3.0,
         bluff_freq: 0.30,
         slowplay_freq: 0.05,
         cbet_freq: 0.85,
@@ -97,7 +97,7 @@ impl Personality {
     pub const BLUFFER: Personality = Personality {
         vpip: 0.30,
         pfr: 0.25,
-        aggression: 3.0,
+        aggression: 2.5,
         bluff_freq: 0.45,
         slowplay_freq: 0.10,
         cbet_freq: 0.80,

@@ -25,17 +25,18 @@ use poker::table::log::HandLogRecord;
 use poker::table::profile::TableProfiles;
 use poker::table::runner::advance_button;
 use poker::ui::anim::{DealAnimationOptions, animate_deal_community, pause, pause_interruptible};
-use poker::ui::input::prompt_action;
+use poker::ui::input::prompt_action_for;
 use poker::ui::render::{
-    ContinueAction, RenderOptions, enter_screen, leave_screen, render, render_showdown,
-    wait_for_continue,
+    ContinueAction, RenderOptions, enter_screen_for, leave_screen_for, render, render_showdown,
+    wait_for_continue_for,
 };
 
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        // 确保终端被恢复
-        let _ = leave_screen();
+        // 确保终端被恢复（两种 backend 都尝试一次，幂等）。
+        let _ = leave_screen_for(poker::config::Layout::Ratatui);
+        let _ = leave_screen_for(poker::config::Layout::Table);
         if e.kind() != ErrorKind::Interrupted {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -91,7 +92,7 @@ fn run(cli: Cli) -> std::io::Result<()> {
     ));
     let mut session = SessionStats::new(cli.stack);
 
-    enter_screen()?;
+    enter_screen_for(layout)?;
 
     let mut hand_idx: u32 = 0;
     let result = loop {
@@ -170,11 +171,11 @@ fn run(cli: Cli) -> std::io::Result<()> {
             if let Some(seat) = state.to_act {
                 let action_stage = state.stage;
                 let action = if seat == hero_seat {
-                    match prompt_action(&state, seat) {
+                    match prompt_action_for(&state, seat, layout) {
                         Ok(a) => a,
                         Err(e) if e.kind() == ErrorKind::Interrupted => {
                             break_game_with_msg(&mut log, "User quit.");
-                            return finish(log, build_session_summary(&session, &state.players, &profiles, hero_seat));
+                            return finish(log, build_session_summary(&session, &state.players, &profiles, hero_seat), layout);
                         }
                         Err(e) => return Err(e),
                     }
@@ -197,7 +198,7 @@ fn run(cli: Cli) -> std::io::Result<()> {
                         )?;
                         if pause_interruptible(cli.bot_think_ms)? {
                             break_game_with_msg(&mut log, "User quit.");
-                            return finish(log, build_session_summary(&session, &players, &profiles, hero_seat));
+                            return finish(log, build_session_summary(&session, &players, &profiles, hero_seat), layout);
                         }
                     }
                     let p = personalities[seat - 1];
@@ -476,7 +477,7 @@ fn run(cli: Cli) -> std::io::Result<()> {
             } else {
                 "Press <space> next, q/Esc quit"
             };
-            match wait_for_continue(prompt) {
+            match wait_for_continue_for(prompt, layout) {
                 Ok(ContinueAction::Next) => break,
                 Ok(ContinueAction::Replay) => {
                     if let Some(last) = history.back() {
@@ -500,7 +501,7 @@ fn run(cli: Cli) -> std::io::Result<()> {
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {
                     break_game_with_msg(&mut log, "User quit.");
-                    return finish(log, build_session_summary(&session, &players, &profiles, hero_seat));
+                    return finish(log, build_session_summary(&session, &players, &profiles, hero_seat), layout);
                 }
                 Err(e) => return Err(e),
             }
@@ -512,7 +513,7 @@ fn run(cli: Cli) -> std::io::Result<()> {
         hand_idx += 1;
     };
 
-    leave_screen()?;
+    leave_screen_for(layout)?;
     for l in build_session_summary(&session, &players, &profiles, hero_seat) {
         println!("{l}");
     }
@@ -523,8 +524,12 @@ fn run(cli: Cli) -> std::io::Result<()> {
     result
 }
 
-fn finish(log: Vec<String>, session_summary: Vec<String>) -> std::io::Result<()> {
-    leave_screen()?;
+fn finish(
+    log: Vec<String>,
+    session_summary: Vec<String>,
+    layout: poker::config::Layout,
+) -> std::io::Result<()> {
+    leave_screen_for(layout)?;
     for l in session_summary {
         println!("{l}");
     }

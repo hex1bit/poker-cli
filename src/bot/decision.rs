@@ -330,6 +330,13 @@ fn preflop_strength_threshold(freq: f64) -> f64 {
 }
 
 /// 决定加注金额（既可能是 Bet，也可能是 Raise）。
+///
+/// 设计原则（避免动辄 all-in，让 bot 像人一样珍惜筹码）：
+/// 1. 计算理论 target，按 equity / aggression / persona 缩放。
+/// 2. Preflop 加注硬封 4× current_bet（除强加注/牌力外）。
+/// 3. SPR 感知：深筹（SPR ≥ 4）下注上限收紧到 ~1×pot；极深（SPR ≥ 8）压到 0.85×pot。
+/// 4. Jam 要满足谨慎条件之一才允许：短筹、强 equity + 低 SPR、已 commit 大量筹码、
+///    或 ShortStacker 在低 BB 时的"短筹推"。其余情况下宁可缩小为非 all-in raise。
 fn raise_size<R: Rng + ?Sized>(
     state: &HandState,
     seat: usize,
@@ -340,44 +347,142 @@ fn raise_size<R: Rng + ?Sized>(
 ) -> Action {
     let pot = state.total_pot().max(state.bb);
     let texture = board_texture(&state.community);
-    // 基础尺度：equity 越高/aggression 越高，下注越大。
+    let bb = state.bb.max(1);
+    let stack = state.players[seat].stack;
+    let committed_round = state.players[seat].committed_round;
+    let committed_total = state.players[seat].committed_total;
+    let stack_bb = stack as f64 / bb as f64;
+    let spr = stack as f64 / pot as f64;
+
+    // 1) 基础 scale。
     let scale = ((equity - 0.35).max(0.0) * 1.5 + 0.5)
         * (0.7 + 0.3 * eff_aggression)
         * persona_sizing_factor(persona, state.stage, texture);
+
     let mut target_total: u64 = if state.current_bet == 0 {
         // open bet
         ((pot as f64) * scale.clamp(0.4, 1.2)) as u64
     } else {
         // raise to total
-        let raise_size = ((pot as f64) * scale.clamp(0.5, 1.5)) as u64;
-        state.current_bet + raise_size
+        let raise_amt = ((pot as f64) * scale.clamp(0.5, 1.5)) as u64;
+        state.current_bet.saturating_add(raise_amt)
     };
-    target_total = target_total.max(state.bb);
 
-    // 校验合法性：必须 ≥ current_bet + min_raise（除非全押）
+    // 2) Preflop 硬封：面对 raise 时，4-bet 上限 = 4× current_bet（除非已是 4-bet+ 池子）。
+    if state.stage == Stage::Preflop && state.current_bet > 0 {
+        let preflop_cap = state.current_bet.saturating_mul(4).max(state.bb * 8);
+        target_total = target_total.min(preflop_cap);
+    }
+
+    // 3) SPR 感知的硬上限（避免无脑变 jam）。
+    let max_total_legal = committed_round.saturating_add(stack);
+    let cap_factor: f64 = if spr >= 8.0 {
+        0.85
+    } else if spr >= 4.0 {
+        1.20
+    } else {
+        2.00
+    };
+    let pot_based_cap: u64 = if state.current_bet == 0 {
+        ((pot as f64) * cap_factor) as u64
+    } else {
+        state
+            .current_bet
+            .saturating_add(((pot as f64) * cap_factor) as u64)
+    };
+    target_total = target_total.min(pot_based_cap).min(max_total_legal);
+
+    // 4) 合法性：>= bb；面对加注时 >= current_bet + min_raise。
+    target_total = target_total.max(bb);
     if state.current_bet > 0 {
-        let min_total = state.current_bet + state.min_raise;
-        if target_total < min_total {
-            target_total = min_total;
-        }
-    } else if target_total < state.bb {
-        target_total = state.bb;
+        let min_total = state.current_bet.saturating_add(state.min_raise);
+        target_total = target_total.max(min_total);
     }
 
-    // 需要付的金额
-    let need_pay = target_total.saturating_sub(state.players[seat].committed_round);
-    let stack = state.players[seat].stack;
-    if persona.label == "ShortStacker" && stack <= pot.saturating_mul(2) {
-        return Action::AllIn;
-    }
+    // 5) Jam 决策。
+    let need_pay = target_total.saturating_sub(committed_round);
+    let already_committed_ratio =
+        committed_total as f64 / (committed_total + stack).max(1) as f64;
+
+    let jam = should_jam(JamCtx {
+        persona,
+        equity,
+        stack_bb,
+        spr,
+        need_pay,
+        stack,
+        already_committed_ratio,
+    });
+
     if need_pay >= stack {
-        return Action::AllIn;
+        // 想 raise 但量超出 stack。
+        if jam {
+            return Action::AllIn;
+        }
+        // 不愿 jam → 缩到 ~50% stack 的非全押 raise。
+        let safer_pay = (stack / 2).max(state.min_raise.max(bb));
+        // 留至少 1 chip 不 all-in。
+        let safer_pay = safer_pay.min(stack.saturating_sub(1)).max(1);
+        target_total = committed_round.saturating_add(safer_pay);
+        // 如果连最小加注门槛都凑不齐，退化为 call/check。
+        if state.current_bet > 0
+            && target_total < state.current_bet.saturating_add(state.min_raise)
+        {
+            return safe_call_or_fold(state, seat, state.to_call_for(seat));
+        }
     }
+
     if state.current_bet == 0 {
         Action::Bet(target_total)
     } else {
         Action::Raise(target_total)
     }
+}
+
+/// Jam 决策上下文。
+struct JamCtx {
+    persona: Personality,
+    equity: f64,
+    stack_bb: f64,
+    spr: f64,
+    need_pay: u64,
+    stack: u64,
+    /// 在本手中已投入的筹码占总筹码（包括未投入）的比例。
+    already_committed_ratio: f64,
+}
+
+/// 是否应该 all-in。基本准则：人类般谨慎，宁可少 raise 也不轻易 jam。
+fn should_jam(c: JamCtx) -> bool {
+    // ShortStacker 性格修订：短筹（≤ 25 BB）且 stack ≤ 1× pot 时才 jam。
+    if c.persona.label == "ShortStacker" && c.stack_bb <= 25.0 && c.spr <= 1.0 {
+        return c.equity > 0.45;
+    }
+    // 极强牌：equity 巨大，直接干掉。
+    if c.equity > 0.92 {
+        return true;
+    }
+    // 短筹推：≤ 15 BB 且 equity 不烂。
+    if c.stack_bb <= 15.0 && c.equity > 0.50 {
+        return true;
+    }
+    // 已经 pot-committed：本手已投入 ≥ 35% 总筹码 + equity 不烂 → 不退缩。
+    if c.already_committed_ratio > 0.35 && c.equity > 0.55 {
+        return true;
+    }
+    // 浅 SPR 强牌：SPR < 3 且 equity > 0.78 → value jam。
+    if c.spr < 3.0 && c.equity > 0.78 {
+        return true;
+    }
+    // 极浅 SPR + 中等牌。
+    if c.spr < 1.5 && c.equity > 0.55 {
+        return true;
+    }
+    // 加注金额本身只占 stack 一小部分（不算 all-in）→ 走 raise，不 jam。
+    if (c.need_pay as f64) < (c.stack as f64) * 0.7 {
+        return false;
+    }
+    // 其余情况：默认不 jam。
+    false
 }
 
 /// 没有 "开桌下注" 选项时（已有 bet/raise）：决定 call / fold。

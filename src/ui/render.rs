@@ -40,6 +40,9 @@ fn nl<W: Write + QueueableCommand>(out: &mut W) -> std::io::Result<()> {
 /// 渲染当前牌局。`hero_seat` = 真人座位下标；`reveal_all` 在摊牌时为 true，显示所有人手牌。
 /// `winners` 列表中的座位会高亮成绿色；`tilt_marks[seat]` 为 true 时该 bot 行尾显示 [T]。
 pub fn render(state: &HandState, opts: RenderOptions<'_>) -> std::io::Result<()> {
+    if opts.layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::render(state, opts);
+    }
     if opts.layout == Layout::Square {
         return render_square(state, opts);
     }
@@ -569,6 +572,14 @@ pub fn write_card<W: Write + QueueableCommand>(out: &mut W, c: Card) -> std::io:
 
 /// 进入备用屏幕缓冲区，隐藏光标。
 pub fn enter_screen() -> std::io::Result<()> {
+    enter_screen_for(Layout::Table)
+}
+
+/// 与 `enter_screen` 类似，但根据 layout 选择 ratatui 或纯 crossterm 路径。
+pub fn enter_screen_for(layout: Layout) -> std::io::Result<()> {
+    if layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::enter_screen();
+    }
     let mut out = stdout();
     out.execute(crossterm::terminal::EnterAlternateScreen)?;
     out.execute(cursor::Hide)?;
@@ -578,6 +589,13 @@ pub fn enter_screen() -> std::io::Result<()> {
 
 /// 退出备用屏幕缓冲区。
 pub fn leave_screen() -> std::io::Result<()> {
+    leave_screen_for(Layout::Table)
+}
+
+pub fn leave_screen_for(layout: Layout) -> std::io::Result<()> {
+    if layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::leave_screen();
+    }
     let mut out = stdout();
     crossterm::terminal::disable_raw_mode()?;
     out.execute(cursor::Show)?;
@@ -594,6 +612,9 @@ pub fn render_showdown(
     hud: Option<&[String]>,
     layout: Layout,
 ) -> std::io::Result<()> {
+    if layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::render_showdown(state, log, winners, tilt_marks, hud);
+    }
     render(
         state,
         RenderOptions {
@@ -619,6 +640,13 @@ pub enum ContinueAction {
 
 /// 阻塞等待按下 Space / Enter / R。
 pub fn wait_for_continue(prompt: &str) -> std::io::Result<ContinueAction> {
+    wait_for_continue_for(prompt, Layout::Table)
+}
+
+pub fn wait_for_continue_for(prompt: &str, layout: Layout) -> std::io::Result<ContinueAction> {
+    if layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::wait_for_continue(prompt);
+    }
     use crossterm::event::{Event, KeyCode, read};
     let mut out = stdout();
     write!(out, "  {prompt} ")?;

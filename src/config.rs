@@ -32,6 +32,7 @@ impl TablePreset {
 pub enum Layout {
     Table,
     Square,
+    Ratatui,
 }
 
 impl Layout {
@@ -39,6 +40,7 @@ impl Layout {
         match s.trim().to_ascii_lowercase().as_str() {
             "table" | "list" => Some(Self::Table),
             "rectangle" | "rect" | "square" | "box" => Some(Self::Square),
+            "ratatui" | "tui" | "widgets" => Some(Self::Ratatui),
             _ => None,
         }
     }
@@ -77,7 +79,7 @@ pub struct Cli {
     /// 显示玩家 HUD 统计（VPIP / PFR / AF）。
     #[arg(long, default_value_t = false)]
     pub hud: bool,
-    /// 牌桌布局：table / rectangle；square/box 为 rectangle 的兼容别名。
+    /// 牌桌布局：table / rectangle / ratatui；square/box 为 rectangle 别名，tui/widgets 为 ratatui 别名。
     #[arg(long, default_value = "table")]
     pub layout: String,
     /// 桌型预设：default / soft / wild / tough / mixed。

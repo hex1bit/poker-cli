@@ -10,12 +10,26 @@ use crossterm::{
     style::{Color, ResetColor, SetForegroundColor},
 };
 
+use crate::config::Layout;
 use crate::game::action::Action;
 use crate::game::state::HandState;
 
 /// 提示真人玩家行动。
 /// 返回 `Err(io::ErrorKind::Interrupted)` 表示用户希望退出游戏。
 pub fn prompt_action(state: &HandState, seat: usize) -> std::io::Result<Action> {
+    prompt_action_for(state, seat, Layout::Table)
+}
+
+/// 与 `prompt_action` 类似，但当 layout=Ratatui 时走 ratatui 路径，避免裸 print
+/// 与 ratatui diff 渲染冲突。
+pub fn prompt_action_for(
+    state: &HandState,
+    seat: usize,
+    layout: Layout,
+) -> std::io::Result<Action> {
+    if layout == Layout::Ratatui {
+        return crate::ui::ratatui_render::prompt_action(state, seat);
+    }
     let to_call = state.to_call_for(seat);
     let stack = state.players[seat].stack;
     let can_check = to_call == 0;
